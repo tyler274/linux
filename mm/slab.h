@@ -238,7 +238,11 @@ struct kmem_cache_per_node_ptrs {
  * Slab cache management.
  */
 struct kmem_cache {
+#ifdef CONFIG_SLAB_MIMALLOC
+	void *mi_priv;
+#else
 	struct slub_percpu_sheaves __percpu *cpu_sheaves;
+#endif
 	/* Used for retrieving partial slabs, etc. */
 	slab_flags_t flags;
 	unsigned long min_partial;

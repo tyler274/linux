@@ -74,6 +74,7 @@ struct ReallocFunc(
 
 impl ReallocFunc {
     // INVARIANT: `krealloc_node_align` satisfies the type invariants.
+    #[cfg(not(CONFIG_SLAB_MIMALLOC))]
     const KREALLOC: Self = Self(bindings::krealloc_node_align);
 
     // INVARIANT: `vrealloc_node_align` satisfies the type invariants.
@@ -163,8 +164,19 @@ unsafe impl Allocator for Kmalloc {
     ) -> Result<NonNull<[u8]>, AllocError> {
         let layout = Kmalloc::aligned_layout(layout);
 
+        #[cfg(CONFIG_SLAB_MIMALLOC)]
+        {
+            // SAFETY: Same requirements as `Allocator::realloc`.
+            return unsafe {
+                crate::alloc::MiKmalloc::realloc(ptr, layout, old_layout, flags, nid)
+            };
+        }
+
+        #[cfg(not(CONFIG_SLAB_MIMALLOC))]
         // SAFETY: `ReallocFunc::call` has the same safety requirements as `Allocator::realloc`.
-        unsafe { ReallocFunc::KREALLOC.call(ptr, layout, old_layout, flags, nid) }
+        unsafe {
+            ReallocFunc::KREALLOC.call(ptr, layout, old_layout, flags, nid)
+        }
     }
 }
 

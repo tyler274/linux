@@ -10,6 +10,32 @@ __rust_helper struct page *rust_helper_alloc_pages(gfp_t gfp_mask,
 	return alloc_pages(gfp_mask, order);
 }
 
+__rust_helper struct page *rust_helper_alloc_pages_node(int nid, gfp_t gfp_mask,
+							unsigned int order)
+{
+	return alloc_pages_node(nid, gfp_mask, order);
+}
+
+__rust_helper struct page *rust_helper_virt_to_page(const void *addr)
+{
+	return virt_to_page(addr);
+}
+
+__rust_helper struct page *rust_helper_virt_to_head_page(const void *addr)
+{
+	return virt_to_head_page(addr);
+}
+
+__rust_helper void *rust_helper_page_address(const struct page *page)
+{
+	return page_address(page);
+}
+
+__rust_helper unsigned int rust_helper_compound_order(const struct page *page)
+{
+	return compound_order(page);
+}
+
 __rust_helper void *rust_helper_kmap_local_page(struct page *page)
 {
 	return kmap_local_page(page);

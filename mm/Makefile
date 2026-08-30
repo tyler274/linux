@@ -5,6 +5,7 @@
 
 KASAN_SANITIZE_slab_common.o := n
 KASAN_SANITIZE_slub.o := n
+KASAN_SANITIZE_mimalloc.o := n
 KASAN_SANITIZE_kmemleak.o := n
 KCSAN_SANITIZE_kmemleak.o := n
 
@@ -13,6 +14,7 @@ KCSAN_SANITIZE_kmemleak.o := n
 # for these when we have more consensus on what to do about them.
 KCSAN_SANITIZE_slab_common.o := n
 KCSAN_SANITIZE_slub.o := n
+KCSAN_SANITIZE_mimalloc.o := n
 KCSAN_SANITIZE_page_alloc.o := n
 # But enable explicit instrumentation for memory barriers.
 KCSAN_INSTRUMENT_BARRIERS := y
@@ -22,6 +24,7 @@ KCSAN_INSTRUMENT_BARRIERS := y
 # free pages, or a task is migrated between nodes.
 KCOV_INSTRUMENT_slab_common.o := n
 KCOV_INSTRUMENT_slub.o := n
+KCOV_INSTRUMENT_mimalloc.o := n
 KCOV_INSTRUMENT_page_alloc.o := n
 KCOV_INSTRUMENT_debug-pagealloc.o := n
 KCOV_INSTRUMENT_kmemleak.o := n
@@ -69,7 +72,11 @@ obj-y += page_frag_cache.o
 obj-y += init-mm.o
 obj-y += memblock.o
 obj-y += $(memory-hotplug-y)
+ifndef CONFIG_SLAB_MIMALLOC
 obj-y += slub.o
+else
+obj-y += mimalloc.o
+endif
 
 ifdef CONFIG_MMU
 	obj-$(CONFIG_ADVISE_SYSCALLS)	+= madvise.o

@@ -165,6 +165,20 @@ config SLUB
 	def_bool y
 	select IRQ_WORK
 
+config SLAB_MIMALLOC
+	bool "Rust mimalloc-inspired slab allocator (EXPERIMENTAL)"
+	depends on RUST && EXPERT
+	depends on !KASAN && !KFENCE && !MEMCG && !SLUB_TINY
+	depends on !SLUB_DEBUG && !MEM_ALLOC_PROFILING
+	depends on !HARDENED_USERCOPY
+	help
+	  Replace SLUB with a mimalloc-inspired allocator written in Rust.
+	  Size-class pages use a thread-local (per-CPU) free list plus a
+	  concurrent CAS free list. This is experimental and lacks memcg,
+	  KASAN, KFENCE, and SLUB debug support.
+
+	  If unsure, say N.
+
 config KVFREE_RCU_BATCHED
 	def_bool y
 	depends on !SLUB_TINY && !TINY_RCU

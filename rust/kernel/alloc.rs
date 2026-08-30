@@ -6,6 +6,7 @@ pub mod allocator;
 pub mod kbox;
 pub mod kvec;
 pub mod layout;
+pub mod mi;
 
 pub use self::kbox::Box;
 pub use self::kbox::KBox;
@@ -17,6 +18,10 @@ pub use self::kvec::KVVec;
 pub use self::kvec::KVec;
 pub use self::kvec::VVec;
 pub use self::kvec::Vec;
+
+pub use self::mi::MiBox;
+pub use self::mi::MiKmalloc;
+pub use self::mi::MiVec;
 
 /// Indicates an allocation error.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -112,6 +117,9 @@ pub mod flags {
     ///
     /// This is normally or'd with other flags.
     pub const __GFP_NOWARN: Flags = Flags(bindings::__GFP_NOWARN);
+
+    /// Allocate a compound page (order > 0).
+    pub const __GFP_COMP: Flags = Flags(bindings::__GFP_COMP);
 }
 
 /// Non Uniform Memory Access (NUMA) node identifier.
