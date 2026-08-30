@@ -174,8 +174,21 @@ config SLAB_MIMALLOC
 	help
 	  Replace SLUB with a mimalloc-inspired allocator written in Rust.
 	  Size-class pages use a thread-local (per-CPU) free list plus a
-	  concurrent CAS free list. This is experimental and lacks memcg,
-	  KASAN, KFENCE, and SLUB debug support.
+	  concurrent CAS free list. Enable CONFIG_RUST_BUDDY to serve those
+	  pages from a Rust buddy (C fallback if the pool is empty). This is
+	  experimental and lacks memcg, KASAN, KFENCE, and SLUB debug support.
+
+	  If unsure, say N.
+
+config RUST_BUDDY
+	bool "Rust buddy page allocator for slab (EXPERIMENTAL)"
+	depends on RUST && EXPERT
+	help
+	  Steal physically contiguous spans from the C page allocator and
+	  serve small-order allocations from a Rust split/coalesce buddy.
+	  The C buddy remains the system allocator; this only backs the
+	  Rust slab (MiKmalloc / CONFIG_SLAB_MIMALLOC), with a fallback
+	  to alloc_pages when the pool is empty.
 
 	  If unsure, say N.
 

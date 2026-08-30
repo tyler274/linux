@@ -2,9 +2,10 @@
 
 //! Page-allocator backend for the mimalloc-inspired slab.
 //!
-//! Folios come from the C buddy (`alloc_pages_node` / `__free_pages`). GFP
-//! flags are passed through; callers must not hold IRQ-disabled locks across a
-//! blocking `alloc_pages` call.
+//! With `CONFIG_RUST_BUDDY`, folios come from the Rust buddy first and fall
+//! back to the C buddy (`alloc_pages_node` / `__free_pages`). GFP flags are
+//! passed through; callers must not hold IRQ-disabled locks across a blocking
+//! `alloc_pages` call.
 
 use crate::{
     alloc::Flags,
@@ -17,6 +18,14 @@ use crate::{
 ///
 /// Returns the head `struct page` pointer, or null on failure.
 pub(super) unsafe fn alloc_folio(order: u32, gfp: Flags, nid: i32) -> *mut bindings::page {
+    #[cfg(CONFIG_RUST_BUDDY)]
+    {
+        crate::alloc::buddy::maybe_init(gfp);
+        let page = crate::alloc::buddy::alloc(order, gfp);
+        if !page.is_null() {
+            return page;
+        }
+    }
     let mut flags = gfp.as_raw();
     if order > 0 {
         flags |= bindings::__GFP_COMP;
@@ -31,6 +40,15 @@ pub(super) unsafe fn alloc_folio(order: u32, gfp: Flags, nid: i32) -> *mut bindi
 ///
 /// `page` must be a head page from [`alloc_folio`] with the same `order`.
 pub(super) unsafe fn free_folio(page: *mut bindings::page, order: u32) {
+    #[cfg(CONFIG_RUST_BUDDY)]
+    {
+        // SAFETY: `page` is a live folio from [`alloc_folio`].
+        if unsafe { crate::alloc::buddy::owns(page) } {
+            // SAFETY: Same as this function; block came from the Rust buddy.
+            unsafe { crate::alloc::buddy::free(page, order) };
+            return;
+        }
+    }
     // SAFETY: Caller guarantees ownership of this folio.
     unsafe { bindings::__free_pages(page, order) };
 }

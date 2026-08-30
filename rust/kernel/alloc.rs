@@ -3,6 +3,8 @@
 //! Implementation of the kernel's memory allocation infrastructure.
 
 pub mod allocator;
+#[cfg(CONFIG_RUST_BUDDY)]
+pub mod buddy;
 pub mod kbox;
 pub mod kvec;
 pub mod layout;

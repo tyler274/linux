@@ -104,7 +104,10 @@ unsafe impl Allocator for MiKmalloc {
 
 /// C ABI used by `mm/mimalloc.c` when `CONFIG_SLAB_MIMALLOC=y`.
 #[no_mangle]
-pub unsafe extern "C" fn rust_mi_init() {}
+pub unsafe extern "C" fn rust_mi_init() {
+    #[cfg(CONFIG_RUST_BUDDY)]
+    crate::alloc::buddy::init(crate::alloc::flags::GFP_KERNEL);
+}
 
 /// Allocate `size` bytes (C `kmalloc` backend).
 ///
