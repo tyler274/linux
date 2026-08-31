@@ -209,9 +209,9 @@ config RUST_MMAP
 	depends on RUST && EXPERT && MMU
 	help
 	  Serve vm_unmapped_area from a Rust first-fit / top-down walk of
-	  existing VMAs, and sequence do_vmi_munmap (range check vs
-	  maple-tree unmap). Maple-tree VMA storage, do_mmap, and
-	  page-fault handling stay in C.
+	  existing VMAs, and sequence do_mmap (prepare vs mmap_region)
+	  and do_vmi_munmap (range check vs maple-tree unmap). Maple-tree
+	  VMA storage and the mmap_region body stay in C.
 
 	  If unsure, say N.
 

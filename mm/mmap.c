@@ -335,21 +335,31 @@ static inline bool file_mmap_ok(struct file *file, struct inode *inode,
  * Returns: Either an error, or the address at which the requested mapping has
  * been performed.
  */
-unsigned long do_mmap(struct file *file, unsigned long addr,
-			unsigned long len, unsigned long prot,
-			unsigned long flags, vma_flags_t vma_flags,
-			unsigned long pgoff, unsigned long *populate,
-			struct list_head *uf)
+#define MMAP_PREP_DONE		0
+#define MMAP_PREP_REGION	1
+
+static int mmap_prepare(struct file *file, unsigned long *addrp,
+			unsigned long *lenp, unsigned long *protp,
+			unsigned long *flagsp, vma_flags_t *vma_flagsp,
+			unsigned long *pgoffp, unsigned long *out)
 {
 	struct mm_struct *mm = current->mm;
 	int pkey = 0;
+	unsigned long addr = *addrp;
+	unsigned long len = *lenp;
+	unsigned long prot = *protp;
+	unsigned long flags = *flagsp;
+	unsigned long pgoff = *pgoffp;
+	vma_flags_t vma_flags = *vma_flagsp;
 
-	*populate = 0;
+	*out = 0;
 
 	mmap_assert_write_locked(mm);
 
-	if (!len)
-		return -EINVAL;
+	if (!len) {
+		*out = -EINVAL;
+		return MMAP_PREP_DONE;
+	}
 
 	/*
 	 * Does the application expect PROT_READ to imply PROT_EXEC?
@@ -370,16 +380,22 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 
 	/* Careful about overflows.. */
 	len = PAGE_ALIGN(len);
-	if (!len)
-		return -ENOMEM;
+	if (!len) {
+		*out = -ENOMEM;
+		return MMAP_PREP_DONE;
+	}
 
 	/* offset overflow? */
-	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
-		return -EOVERFLOW;
+	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff) {
+		*out = -EOVERFLOW;
+		return MMAP_PREP_DONE;
+	}
 
 	/* Too many mappings? */
-	if (mm->map_count > get_sysctl_max_map_count())
-		return -ENOMEM;
+	if (mm->map_count > get_sysctl_max_map_count()) {
+		*out = -ENOMEM;
+		return MMAP_PREP_DONE;
+	}
 
 	/*
 	 * addr is returned from get_unmapped_area,
@@ -413,28 +429,38 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 * that it represents a valid section of the address space.
 	 */
 	addr = __get_unmapped_area(file, addr, len, pgoff, flags, vma_flags);
-	if (IS_ERR_VALUE(addr))
-		return addr;
+	if (IS_ERR_VALUE(addr)) {
+		*out = addr;
+		return MMAP_PREP_DONE;
+	}
 
 	if (flags & MAP_FIXED_NOREPLACE) {
-		if (find_vma_intersection(mm, addr, addr + len))
-			return -EEXIST;
+		if (find_vma_intersection(mm, addr, addr + len)) {
+			*out = -EEXIST;
+			return MMAP_PREP_DONE;
+		}
 	}
 
 	if (flags & MAP_LOCKED)
-		if (!can_do_mlock())
-			return -EPERM;
+		if (!can_do_mlock()) {
+			*out = -EPERM;
+			return MMAP_PREP_DONE;
+		}
 
-	if (!mlock_future_ok(mm, vma_flags_test(&vma_flags, VMA_LOCKED_BIT), len))
-		return -EAGAIN;
+	if (!mlock_future_ok(mm, vma_flags_test(&vma_flags, VMA_LOCKED_BIT), len)) {
+		*out = -EAGAIN;
+		return MMAP_PREP_DONE;
+	}
 
 	if (file) {
 		struct inode *inode = file_inode(file);
 		unsigned long flags_mask;
 		int err;
 
-		if (!file_mmap_ok(file, inode, pgoff, len))
-			return -EOVERFLOW;
+		if (!file_mmap_ok(file, inode, pgoff, len)) {
+			*out = -EOVERFLOW;
+			return MMAP_PREP_DONE;
+		}
 
 		flags_mask = LEGACY_MAP_MASK;
 		if (file->f_op->fop_flags & FOP_MMAP_SYNC)
@@ -452,21 +478,29 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			flags &= LEGACY_MAP_MASK;
 			fallthrough;
 		case MAP_SHARED_VALIDATE:
-			if (flags & ~flags_mask)
-				return -EOPNOTSUPP;
+			if (flags & ~flags_mask) {
+				*out = -EOPNOTSUPP;
+				return MMAP_PREP_DONE;
+			}
 			if (prot & PROT_WRITE) {
-				if (!(file->f_mode & FMODE_WRITE))
-					return -EACCES;
-				if (IS_SWAPFILE(file->f_mapping->host))
-					return -ETXTBSY;
+				if (!(file->f_mode & FMODE_WRITE)) {
+					*out = -EACCES;
+					return MMAP_PREP_DONE;
+				}
+				if (IS_SWAPFILE(file->f_mapping->host)) {
+					*out = -ETXTBSY;
+					return MMAP_PREP_DONE;
+				}
 			}
 
 			/*
 			 * Make sure we don't allow writing to an append-only
 			 * file..
 			 */
-			if (IS_APPEND(inode) && (file->f_mode & FMODE_WRITE))
-				return -EACCES;
+			if (IS_APPEND(inode) && (file->f_mode & FMODE_WRITE)) {
+				*out = -EACCES;
+				return MMAP_PREP_DONE;
+			}
 
 			vma_flags_set(&vma_flags, VMA_SHARED_BIT, VMA_MAYSHARE_BIT);
 			if (!(file->f_mode & FMODE_WRITE))
@@ -474,22 +508,31 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 						VMA_SHARED_BIT);
 			fallthrough;
 		case MAP_PRIVATE:
-			if (!(file->f_mode & FMODE_READ))
-				return -EACCES;
+			if (!(file->f_mode & FMODE_READ)) {
+				*out = -EACCES;
+				return MMAP_PREP_DONE;
+			}
 			if (path_noexec(&file->f_path)) {
-				if (vma_flags_test(&vma_flags, VMA_EXEC_BIT))
-					return -EPERM;
+				if (vma_flags_test(&vma_flags, VMA_EXEC_BIT)) {
+					*out = -EPERM;
+					return MMAP_PREP_DONE;
+				}
 				vma_flags_clear(&vma_flags, VMA_MAYEXEC_BIT);
 			}
 
-			if (!can_mmap_file(file))
-				return -ENODEV;
-			if (vma_flags_can_grow(&vma_flags))
-				return -EINVAL;
+			if (!can_mmap_file(file)) {
+				*out = -ENODEV;
+				return MMAP_PREP_DONE;
+			}
+			if (vma_flags_can_grow(&vma_flags)) {
+				*out = -EINVAL;
+				return MMAP_PREP_DONE;
+			}
 			break;
 
 		default:
-			return -EINVAL;
+			*out = -EINVAL;
+			return MMAP_PREP_DONE;
 		}
 
 		/*
@@ -497,13 +540,17 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		 * flags if necessary to avoid future seal violations.
 		 */
 		err = memfd_check_seals_mmap(file, &vma_flags);
-		if (err)
-			return (unsigned long)err;
+		if (err) {
+			*out = (unsigned long)err;
+			return MMAP_PREP_DONE;
+		}
 	} else {
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
-			if (vma_flags_can_grow(&vma_flags))
-				return -EINVAL;
+			if (vma_flags_can_grow(&vma_flags)) {
+				*out = -EINVAL;
+				return MMAP_PREP_DONE;
+			}
 			/*
 			 * Ignore pgoff.
 			 */
@@ -513,8 +560,10 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		case MAP_DROPPABLE: {
 			vma_flags_t droppable = VMA_DROPPABLE;
 
-			if (vma_flags_empty(&droppable))
-				return -EOPNOTSUPP;
+			if (vma_flags_empty(&droppable)) {
+				*out = -EOPNOTSUPP;
+				return MMAP_PREP_DONE;
+			}
 			vma_flags_set_mask(&vma_flags, droppable);
 
 			/*
@@ -525,10 +574,14 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			 *
 			 * And don't attempt to combine with hugetlb for now.
 			 */
-			if (flags & (MAP_LOCKED | MAP_HUGETLB))
-			        return -EINVAL;
-			if (vma_flags_can_grow(&vma_flags))
-			        return -EINVAL;
+			if (flags & (MAP_LOCKED | MAP_HUGETLB)) {
+				*out = -EINVAL;
+				return MMAP_PREP_DONE;
+			}
+			if (vma_flags_can_grow(&vma_flags)) {
+				*out = -EINVAL;
+				return MMAP_PREP_DONE;
+			}
 
 			/*
 			 * If the pages can be dropped, then it doesn't make
@@ -552,7 +605,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			pgoff = addr >> PAGE_SHIFT;
 			break;
 		default:
-			return -EINVAL;
+			*out = -EINVAL;
+			return MMAP_PREP_DONE;
 		}
 	}
 
@@ -570,12 +624,85 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			vma_flags_set(&vma_flags, VMA_NORESERVE_BIT);
 	}
 
-	addr = mmap_region(file, addr, len, vma_flags, pgoff, uf);
+	*addrp = addr;
+	*lenp = len;
+	*protp = prot;
+	*flagsp = flags;
+	*pgoffp = pgoff;
+	*vma_flagsp = vma_flags;
+	return MMAP_PREP_REGION;
+}
+
+static void mmap_maybe_populate(unsigned long addr, unsigned long flags,
+				vma_flags_t *vma_flags, unsigned long len,
+				unsigned long *populate)
+{
 	if (!IS_ERR_VALUE(addr) &&
-	    (vma_flags_test(&vma_flags, VMA_LOCKED_BIT) ||
+	    (vma_flags_test(vma_flags, VMA_LOCKED_BIT) ||
 	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
 		*populate = len;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_dommap_prepare(struct file *file, unsigned long *addr,
+			unsigned long *len, unsigned long *prot,
+			unsigned long *flags, vma_flags_t *vma_flags,
+			unsigned long *pgoff, unsigned long *out)
+{
+	return mmap_prepare(file, addr, len, prot, flags, vma_flags, pgoff,
+			    out);
+}
+
+unsigned long rust_dommap_region(struct file *file, unsigned long addr,
+				 unsigned long len, vma_flags_t *vma_flags,
+				 unsigned long pgoff, struct list_head *uf)
+{
+	return mmap_region(file, addr, len, *vma_flags, pgoff, uf);
+}
+
+void rust_dommap_populate(unsigned long addr, unsigned long flags,
+			  vma_flags_t *vma_flags, unsigned long len,
+			  unsigned long *populate)
+{
+	mmap_maybe_populate(addr, flags, vma_flags, len, populate);
+}
+#endif
+
+static unsigned long finish_mmap(struct file *file, unsigned long addr,
+			unsigned long len, unsigned long prot,
+			unsigned long flags, vma_flags_t vma_flags,
+			unsigned long pgoff, unsigned long *populate,
+			struct list_head *uf)
+{
+	unsigned long out = 0;
+
+	*populate = 0;
+	if (mmap_prepare(file, &addr, &len, &prot, &flags, &vma_flags, &pgoff,
+			 &out) == MMAP_PREP_DONE)
+		return out;
+	addr = mmap_region(file, addr, len, vma_flags, pgoff, uf);
+	mmap_maybe_populate(addr, flags, &vma_flags, len, populate);
 	return addr;
+}
+
+unsigned long do_mmap(struct file *file, unsigned long addr,
+			unsigned long len, unsigned long prot,
+			unsigned long flags, vma_flags_t vma_flags,
+			unsigned long pgoff, unsigned long *populate,
+			struct list_head *uf)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	unsigned long rust_ret;
+
+	rust_ret = rust_dommap_dispatch(file, &addr, &len, &prot, &flags,
+					&vma_flags, &pgoff, populate, uf,
+					&handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mmap(file, addr, len, prot, flags, vma_flags, pgoff,
+			   populate, uf);
 }
 
 unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,

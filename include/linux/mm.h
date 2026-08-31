@@ -4325,6 +4325,23 @@ int rust_munmap_classify(struct vma_iterator *vmi, struct mm_struct *mm,
 int rust_munmap_align(struct vma_iterator *vmi, struct vm_area_struct *vma,
 		      struct mm_struct *mm, unsigned long start,
 		      unsigned long end, struct list_head *uf, bool unlock);
+#define RUST_DOMMAP_DONE	0
+#define RUST_DOMMAP_REGION	1
+unsigned long rust_dommap_dispatch(struct file *file, unsigned long *addr,
+				   unsigned long *len, unsigned long *prot,
+				   unsigned long *flags, vma_flags_t *vma_flags,
+				   unsigned long *pgoff, unsigned long *populate,
+				   struct list_head *uf, int *handled);
+int rust_dommap_prepare(struct file *file, unsigned long *addr,
+			unsigned long *len, unsigned long *prot,
+			unsigned long *flags, vma_flags_t *vma_flags,
+			unsigned long *pgoff, unsigned long *out);
+unsigned long rust_dommap_region(struct file *file, unsigned long addr,
+				 unsigned long len, vma_flags_t *vma_flags,
+				 unsigned long pgoff, struct list_head *uf);
+void rust_dommap_populate(unsigned long addr, unsigned long flags,
+			  vma_flags_t *vma_flags, unsigned long len,
+			  unsigned long *populate);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

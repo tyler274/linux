@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Userspace VA search and munmap dispatch when `CONFIG_RUST_MMAP=y`.
+//! Userspace VA search and mmap/munmap dispatch when `CONFIG_RUST_MMAP=y`.
 //!
 //! Replaces the maple-tree walk in `unmapped_area()` / `unmapped_area_topdown()`
 //! with a first-fit (bottom-up or top-down) walk of existing VMAs, and
-//! sequences `do_vmi_munmap` (range check vs maple-tree unmap). Maple-tree
-//! storage, `do_mmap`, and page-fault handling stay in C. The mmap lock is
-//! already held by the C caller.
+//! sequences `do_mmap` (prepare vs `mmap_region`) and `do_vmi_munmap`
+//! (range check vs maple-tree unmap). Maple-tree storage and the
+//! `mmap_region` body stay in C. The mmap lock is already held by the C
+//! caller.
 
 use crate::{
     bindings,
@@ -32,7 +33,13 @@ const MUNMAP_DONE: i32 = 0;
 /// Overlapping VMA found; maple-tree unmap.
 const MUNMAP_ALIGN: i32 = 1;
 
+/// Matches `RUST_DOMMAP_*` in `include/linux/mm.h`.
+const DOMMAP_DONE: i32 = 0;
+/// Flags and VA chosen; install via `mmap_region`.
+const DOMMAP_REGION: i32 = 1;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
+static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -219,9 +226,9 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
     None
 }
 
-/// Log that Rust is serving `vm_unmapped_area` and munmap dispatch.
+/// Log that Rust is serving `vm_unmapped_area` and mmap/munmap dispatch.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and munmap sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -309,6 +316,91 @@ pub unsafe extern "C" fn rust_munmap_dispatch(
         _ => {
             pr_err!("rust-mmap: unknown munmap kind {kind}\n");
             EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `do_mmap` after C prepares flags and the VA.
+///
+/// Sets `*handled` once prepare has run (including early errors).
+/// `mmap_region` installs the VMA.
+///
+/// # Safety
+///
+/// mmap write lock held as for `do_mmap`. Pointer arguments except
+/// `file` and `uf` must be live. `handled` must be a valid
+/// out-parameter. `file` and `uf` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn rust_dommap_dispatch(
+    file: *mut bindings::file,
+    addr: *mut c_ulong,
+    len: *mut c_ulong,
+    prot: *mut c_ulong,
+    flags: *mut c_ulong,
+    vma_flags: *mut bindings::vma_flags_t,
+    pgoff: *mut c_ulong,
+    populate: *mut c_ulong,
+    uf: *mut bindings::list_head,
+    handled: *mut c_int,
+) -> c_ulong {
+    if addr.is_null()
+        || len.is_null()
+        || prot.is_null()
+        || flags.is_null()
+        || vma_flags.is_null()
+        || pgoff.is_null()
+        || populate.is_null()
+        || handled.is_null()
+    {
+        return EINVAL.to_errno() as c_ulong;
+    }
+    // SAFETY: Caller supplies writable out-parameters.
+    unsafe {
+        *handled = 0;
+        *populate = 0;
+    }
+
+    let mut out: c_ulong = 0;
+    // SAFETY: Same lock as `do_mmap`; in/out pointers are live.
+    let kind = unsafe {
+        bindings::rust_dommap_prepare(
+            file, addr, len, prot, flags, vma_flags, pgoff, &mut out,
+        )
+    };
+    // Prepare may have chosen a VA and mutated flags. C must not re-prepare.
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_DOMMAP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mmap sequenced\n");
+    }
+
+    match kind {
+        DOMMAP_DONE => out,
+        DOMMAP_REGION => {
+            // SAFETY: Prepare succeeded; mmap write lock still held.
+            let mapped = unsafe {
+                bindings::rust_dommap_region(
+                    file,
+                    *addr,
+                    *len,
+                    vma_flags,
+                    *pgoff,
+                    uf,
+                )
+            };
+            // SAFETY: `populate` is the live out-parameter from `do_mmap`.
+            unsafe {
+                bindings::rust_dommap_populate(
+                    mapped, *flags, vma_flags, *len, populate,
+                );
+            }
+            mapped
+        }
+        _ => {
+            pr_err!("rust-mmap: unknown mmap kind {kind}\n");
+            EINVAL.to_errno() as c_ulong
         }
     }
 }
