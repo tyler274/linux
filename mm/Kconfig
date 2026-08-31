@@ -210,9 +210,10 @@ config RUST_MMAP
 	help
 	  Serve vm_unmapped_area from a Rust first-fit / top-down walk of
 	  existing VMAs, and sequence do_mmap (prepare vs mmap_region),
-	  do_vmi_munmap (range check vs maple-tree unmap), and
-	  do_brk_flags (expand vs new anonymous VMA). Maple-tree VMA
-	  storage and the mmap_region body stay in C.
+	  do_vmi_munmap (range check vs maple-tree unmap), do_brk_flags
+	  (expand vs new anonymous VMA), and do_mprotect_pkey (validate
+	  vs VMA walk). Maple-tree VMA storage and the mmap_region body
+	  stay in C.
 
 	  If unsure, say N.
 

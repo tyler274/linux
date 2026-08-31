@@ -868,36 +868,86 @@ fail:
 /*
  * pkey==-1 when doing a legacy mprotect()
  */
-static int do_mprotect_pkey(unsigned long start, size_t len,
-		unsigned long prot, int pkey)
+#define MPROTECT_DONE		0
+#define MPROTECT_APPLY		1
+
+#ifndef CONFIG_RUST_MMAP
+struct rust_mprotect_req {
+	unsigned long start;
+	size_t len;
+	unsigned long prot;
+	int pkey;
+	unsigned long end;
+	unsigned long reqprot;
+	int grows;
+	int rier;
+};
+#endif
+
+static int mprotect_validate(struct rust_mprotect_req *req, int *out)
 {
-	unsigned long nstart, end, tmp, reqprot;
+	unsigned long start;
+	size_t len;
+	unsigned long prot;
+	int grows;
+	int rier;
+
+	*out = 0;
+	start = untagged_addr(req->start);
+	len = req->len;
+	prot = req->prot;
+	grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
+	rier = (current->personality & READ_IMPLIES_EXEC) && (prot & PROT_READ);
+
+	prot &= ~(PROT_GROWSDOWN | PROT_GROWSUP);
+	if (grows == (PROT_GROWSDOWN | PROT_GROWSUP)) {
+		*out = -EINVAL;
+		return MPROTECT_DONE;
+	}
+
+	if (start & ~PAGE_MASK) {
+		*out = -EINVAL;
+		return MPROTECT_DONE;
+	}
+	if (!len) {
+		*out = 0;
+		return MPROTECT_DONE;
+	}
+	len = PAGE_ALIGN(len);
+	req->end = start + len;
+	if (req->end <= start) {
+		*out = -ENOMEM;
+		return MPROTECT_DONE;
+	}
+	if (!arch_validate_prot(prot, start)) {
+		*out = -EINVAL;
+		return MPROTECT_DONE;
+	}
+
+	req->start = start;
+	req->len = len;
+	req->prot = prot;
+	req->reqprot = prot;
+	req->grows = grows;
+	req->rier = rier;
+	return MPROTECT_APPLY;
+}
+
+static int mprotect_apply(struct rust_mprotect_req *req)
+{
+	unsigned long nstart, end, tmp, reqprot, prot, start;
 	struct vm_area_struct *vma, *prev;
 	int error;
-	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
-	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
-				(prot & PROT_READ);
+	const int grows = req->grows;
+	const bool rier = req->rier;
+	int pkey = req->pkey;
 	struct mmu_gather tlb;
 	struct vma_iterator vmi;
 
-	start = untagged_addr(start);
-
-	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
-	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
-		return -EINVAL;
-
-	if (start & ~PAGE_MASK)
-		return -EINVAL;
-	if (!len)
-		return 0;
-	len = PAGE_ALIGN(len);
-	end = start + len;
-	if (end <= start)
-		return -ENOMEM;
-	if (!arch_validate_prot(prot, start))
-		return -EINVAL;
-
-	reqprot = prot;
+	start = req->start;
+	end = req->end;
+	prot = req->prot;
+	reqprot = req->reqprot;
 
 	if (mmap_write_lock_killable(current->mm))
 		return -EINTR;
@@ -1015,6 +1065,52 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 out:
 	mmap_write_unlock(current->mm);
 	return error;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mprotect_validate(struct rust_mprotect_req *req, int *out)
+{
+	return mprotect_validate(req, out);
+}
+
+int rust_mprotect_apply(struct rust_mprotect_req *req)
+{
+	return mprotect_apply(req);
+}
+#endif
+
+static int finish_mprotect_pkey(unsigned long start, size_t len,
+		unsigned long prot, int pkey)
+{
+	struct rust_mprotect_req req;
+	int out = 0;
+
+	req.start = start;
+	req.len = len;
+	req.prot = prot;
+	req.pkey = pkey;
+	if (mprotect_validate(&req, &out) == MPROTECT_DONE)
+		return out;
+	return mprotect_apply(&req);
+}
+
+static int do_mprotect_pkey(unsigned long start, size_t len,
+		unsigned long prot, int pkey)
+{
+#ifdef CONFIG_RUST_MMAP
+	struct rust_mprotect_req req;
+	int handled = 0;
+	int rust_ret;
+
+	req.start = start;
+	req.len = len;
+	req.prot = prot;
+	req.pkey = pkey;
+	rust_ret = rust_mprotect_dispatch(&req, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mprotect_pkey(start, len, prot, pkey);
 }
 
 SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,

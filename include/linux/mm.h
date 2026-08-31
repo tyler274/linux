@@ -4358,6 +4358,21 @@ int rust_brk_new(struct vma_iterator *vmi, struct vm_area_struct **vma,
 		 int *out);
 void rust_brk_account(struct vm_area_struct *vma, unsigned long len,
 		      vma_flags_t *vma_flags);
+struct rust_mprotect_req {
+	unsigned long start;
+	size_t len;
+	unsigned long prot;
+	int pkey;
+	unsigned long end;
+	unsigned long reqprot;
+	int grows;
+	int rier;
+};
+#define RUST_MPROTECT_DONE	0
+#define RUST_MPROTECT_APPLY	1
+int rust_mprotect_dispatch(struct rust_mprotect_req *req, int *handled);
+int rust_mprotect_validate(struct rust_mprotect_req *req, int *out);
+int rust_mprotect_apply(struct rust_mprotect_req *req);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

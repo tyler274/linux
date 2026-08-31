@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Userspace VA search and mmap/munmap/brk dispatch when `CONFIG_RUST_MMAP=y`.
+//! Userspace VA search and mmap/munmap/brk/mprotect dispatch when
+//! `CONFIG_RUST_MMAP=y`.
 //!
 //! Replaces the maple-tree walk in `unmapped_area()` / `unmapped_area_topdown()`
 //! with a first-fit (bottom-up or top-down) walk of existing VMAs, and
 //! sequences `do_mmap` (prepare vs `mmap_region`), `do_vmi_munmap` (range
-//! check vs maple-tree unmap), and `do_brk_flags` (expand vs new anonymous
-//! VMA). Maple-tree storage and the `mmap_region` body stay in C. The mmap
-//! lock is already held by the C caller.
+//! check vs maple-tree unmap), `do_brk_flags` (expand vs new anonymous VMA),
+//! and `do_mprotect_pkey` (validate vs VMA walk). Maple-tree storage and
+//! the `mmap_region` / `mprotect_fixup` bodies stay in C. The mmap lock is
+//! already held by the C caller except for mprotect, which takes it in
+//! apply.
 
 use crate::{
     bindings,
@@ -47,9 +50,15 @@ const BRK_NEW: i32 = 2;
 /// Merge or new succeeded; account the mapping.
 const BRK_ACCT: i32 = 3;
 
+/// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
+const MPROTECT_DONE: i32 = 0;
+/// Range is valid; lock and walk VMAs.
+const MPROTECT_APPLY: i32 = 1;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
+static N_MPROTECT: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -236,9 +245,9 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
     None
 }
 
-/// Log that Rust is serving `vm_unmapped_area` and mmap/munmap/brk dispatch.
+/// Log that Rust is serving `vm_unmapped_area` and mmap/munmap/brk/mprotect.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -486,4 +495,46 @@ pub unsafe extern "C" fn rust_brk_dispatch(
     // SAFETY: Expand or new succeeded; `vma` is the live mapping.
     unsafe { bindings::rust_brk_account(vma, len, vma_flags) };
     0
+}
+
+/// C ABI: sequence `do_mprotect_pkey` after C validates the range.
+///
+/// Sets `*handled` once validate has run. The mmap lock and VMA walk
+/// stay in C.
+///
+/// # Safety
+///
+/// `req` must be a live request filled by `do_mprotect_pkey`. `handled`
+/// must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mprotect_dispatch(
+    req: *mut bindings::rust_mprotect_req,
+    handled: *mut c_int,
+) -> c_int {
+    if req.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `req` holds the syscall arguments.
+    let kind = unsafe { bindings::rust_mprotect_validate(req, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MPROTECT.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mprotect sequenced\n");
+    }
+
+    match kind {
+        MPROTECT_DONE => out,
+        // SAFETY: Range is valid; apply takes the mmap write lock.
+        MPROTECT_APPLY => unsafe { bindings::rust_mprotect_apply(req) },
+        _ => {
+            pr_err!("rust-mmap: unknown mprotect kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
 }
