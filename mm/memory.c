@@ -3982,6 +3982,124 @@ vm_fault_t __vmf_anon_prepare(struct vm_fault *vmf)
  *   held to the old page, as well as updating the rmap.
  * - In any case, unlock the PTL and drop the reference we took to the old page.
  */
+#ifdef CONFIG_RUST_FAULT
+int rust_wp_prepare(struct vm_fault *vmf, vm_fault_t *out)
+{
+	struct folio *old_folio = vmf->page ? page_folio(vmf->page) : NULL;
+
+	*out = vmf_anon_prepare(vmf);
+	if (*out) {
+		if (old_folio)
+			folio_put(old_folio);
+		return 1;
+	}
+	return 0;
+}
+
+struct folio *rust_wp_alloc_folio(struct vm_fault *vmf)
+{
+	bool pfn_is_zero = is_zero_pfn(pte_pfn(vmf->orig_pte));
+
+	return folio_prealloc(vmf->vma->vm_mm, vmf->vma, vmf->address,
+			      pfn_is_zero);
+}
+
+int rust_wp_copy_user(struct vm_fault *vmf, struct folio *new_folio,
+		      vm_fault_t *out)
+{
+	struct folio *old_folio = vmf->page ? page_folio(vmf->page) : NULL;
+	int err;
+
+	*out = 0;
+	if (is_zero_pfn(pte_pfn(vmf->orig_pte)))
+		return 0;
+
+	err = __wp_page_copy_user(&new_folio->page, vmf->page, vmf);
+	if (err) {
+		folio_put(new_folio);
+		if (old_folio)
+			folio_put(old_folio);
+		*out = err == -EHWPOISON ? VM_FAULT_HWPOISON : 0;
+		return 1;
+	}
+	kmsan_copy_page_meta(&new_folio->page, vmf->page);
+	return 0;
+}
+
+void rust_wp_put_old(struct vm_fault *vmf)
+{
+	if (vmf->page)
+		folio_put(page_folio(vmf->page));
+}
+
+vm_fault_t rust_wp_install_folio(struct vm_fault *vmf, struct folio *new_folio)
+{
+	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct folio *old_folio = vmf->page ? page_folio(vmf->page) : NULL;
+	pte_t entry;
+	int page_copied = 0;
+	struct mmu_notifier_range range;
+
+	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
+				vmf->address & PAGE_MASK,
+				(vmf->address & PAGE_MASK) + PAGE_SIZE);
+	mmu_notifier_invalidate_range_start(&range);
+
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (likely(vmf->pte && pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		if (old_folio) {
+			if (!folio_test_anon(old_folio)) {
+				dec_mm_counter(mm, mm_counter_file(old_folio));
+				inc_mm_counter(mm, MM_ANONPAGES);
+			}
+		} else {
+			ksm_might_unmap_zero_page(mm, vmf->orig_pte);
+			inc_mm_counter(mm, MM_ANONPAGES);
+		}
+		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+		entry = folio_mk_pte(new_folio, vma->vm_page_prot);
+		entry = pte_sw_mkyoung(entry);
+		if (unlikely(unshare)) {
+			if (pte_soft_dirty(vmf->orig_pte))
+				entry = pte_mksoft_dirty(entry);
+			if (pte_uffd(vmf->orig_pte))
+				entry = pte_mkuffd(entry);
+		} else {
+			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+		}
+
+		ptep_clear_flush(vma, vmf->address, vmf->pte);
+		folio_add_new_anon_rmap(new_folio, vma, vmf->address, RMAP_EXCLUSIVE);
+		folio_add_lru_vma(new_folio, vma);
+		BUG_ON(unshare && pte_write(entry));
+		set_pte_at(mm, vmf->address, vmf->pte, entry);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+		if (old_folio)
+			folio_remove_rmap_pte(old_folio, vmf->page, vma);
+
+		new_folio = old_folio;
+		page_copied = 1;
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	} else if (vmf->pte) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	}
+
+	mmu_notifier_invalidate_range_end(&range);
+
+	if (new_folio)
+		folio_put(new_folio);
+	if (old_folio) {
+		if (page_copied)
+			free_swap_cache(old_folio);
+		folio_put(old_folio);
+	}
+	return 0;
+}
+#endif
+
 static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 {
 	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
@@ -3994,6 +4112,16 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	struct mmu_notifier_range range;
 	vm_fault_t ret;
 	bool pfn_is_zero;
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	delayacct_wpcopy_start();
+	rust_ret = rust_wp_page_copy(vmf, &handled);
+	delayacct_wpcopy_end();
+	if (handled)
+		return rust_ret;
+#endif
 
 	delayacct_wpcopy_start();
 

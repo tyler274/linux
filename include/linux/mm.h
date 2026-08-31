@@ -4321,6 +4321,13 @@ int rust_anon_write_prepare(struct vm_fault *vmf, vm_fault_t *out);
 struct folio *rust_anon_alloc_folio(struct vm_fault *vmf);
 void rust_anon_folio_uptodate(struct folio *folio);
 vm_fault_t rust_anon_install_folio(struct vm_fault *vmf, struct folio *folio);
+vm_fault_t rust_wp_page_copy(struct vm_fault *vmf, int *handled);
+int rust_wp_prepare(struct vm_fault *vmf, vm_fault_t *out);
+struct folio *rust_wp_alloc_folio(struct vm_fault *vmf);
+int rust_wp_copy_user(struct vm_fault *vmf, struct folio *new_folio,
+		      vm_fault_t *out);
+void rust_wp_put_old(struct vm_fault *vmf);
+vm_fault_t rust_wp_install_folio(struct vm_fault *vmf, struct folio *new_folio);
 #endif
 
 /* truncate.c */

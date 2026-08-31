@@ -218,9 +218,10 @@ config RUST_FAULT
 	bool "Rust anonymous write-fault handler (EXPERIMENTAL)"
 	depends on RUST && EXPERT && MMU
 	help
-	  Serve private anonymous write faults from Rust. Page-table
-	  install, rmap, and the zero-page read path stay in C. File,
-	  swap, THP, and userfaultfd faults also stay in C.
+	  Serve private anonymous write faults and copy-on-write from
+	  Rust. Page-table install, rmap, and the zero-page read path
+	  stay in C. File, swap, THP, and userfaultfd faults also stay
+	  in C.
 
 	  If unsure, say N.
 
