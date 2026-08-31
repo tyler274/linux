@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! PTE fault dispatch when `CONFIG_RUST_FAULT=y`.
+//! PTE and mm-fault dispatch when `CONFIG_RUST_FAULT=y`.
 //!
-//! `handle_pte_fault` is sequenced here: missing, swap, NUMA, uffd-rwp,
-//! write-protect, and access-flag update. Private anonymous read (zero-page)
-//! and write faults and `wp_page_copy` are also sequenced here. Page-table
-//! lookup, arch PTE encoding, rmap, user copy, and the file/swap/THP/uffd
-//! bodies stay in C (`rust_pte_*` / `rust_wp_*` / `rust_anon_*` in
-//! `mm/memory.c`). Write-protect reuse vs copy is sequenced here.
+//! `__handle_mm_fault` (PUD/PMD/THP vs PTE) and `handle_pte_fault` are
+//! sequenced here: missing, swap, NUMA, uffd-rwp, write-protect, and
+//! access-flag update. Private anonymous read (zero-page) and write
+//! faults, `wp_page_copy`, write-protect reuse, and file read/COW/shared
+//! faults are also sequenced here. Page-table walk, arch PTE encoding,
+//! rmap, user copy, and the filemap/swap/THP/uffd bodies stay in C.
 
 use crate::{
     bindings,
@@ -26,6 +26,8 @@ static N_FAULTS: Atomic<u32> = Atomic::new(0);
 static N_ZERO: Atomic<u32> = Atomic::new(0);
 static N_COW: Atomic<u32> = Atomic::new(0);
 static N_REUSE: Atomic<u32> = Atomic::new(0);
+static N_FILE: Atomic<u32> = Atomic::new(0);
+static N_MMF: Atomic<u32> = Atomic::new(0);
 
 /// Matches `RUST_PTE_*` in `include/linux/mm.h`.
 const PTE_DONE: i32 = 0;
@@ -51,9 +53,44 @@ const WP_REUSE: i32 = 3;
 /// Must copy; PTL dropped and old page referenced if present.
 const WP_COPY: i32 = 4;
 
-/// Log that Rust is serving PTE dispatch, anonymous faults, and COW.
+/// Matches `RUST_FILE_*` in `include/linux/mm.h`.
+const FILE_DONE: i32 = 0;
+/// File read fault (`do_read_fault`).
+const FILE_READ: i32 = 1;
+/// Private file write: COW from the file page.
+const FILE_COW: i32 = 2;
+/// Shared file write (`do_shared_fault`).
+const FILE_SHARED: i32 = 3;
+
+/// Matches `RUST_MMF_*` in `include/linux/mm.h`.
+const MMF_DONE: i32 = 0;
+/// Continue from PUD/PMD classify to the next step.
+const MMF_CONT: i32 = 1;
+/// `pmd_alloc` raced with a huge PUD; retry PUD.
+const MMF_RETRY_PUD: i32 = 2;
+/// Empty PUD that may take a huge page.
+const MMF_HUGE_PUD: i32 = 3;
+/// Write fault on a huge PUD.
+const MMF_WP_HUGE_PUD: i32 = 4;
+/// Empty PMD that may take a THP.
+const MMF_HUGE_PMD: i32 = 5;
+/// Device-private huge PMD.
+const MMF_DEV_PRIVATE: i32 = 6;
+/// uffd-rwp on a huge PMD.
+const MMF_UFFD_RWP: i32 = 7;
+/// NUMA hinting on a huge PMD.
+const MMF_NUMA: i32 = 8;
+/// Write/unshare on a huge PMD without write permission.
+const MMF_WP_HUGE_PMD: i32 = 9;
+/// Fall back to `handle_pte_fault`.
+const MMF_PTE: i32 = 10;
+
+/// `VM_FAULT_FALLBACK` from [`enum vm_fault_reason`].
+const VM_FAULT_FALLBACK: u32 = 0x800;
+
+/// Log that Rust is serving mm-fault, PTE dispatch, anonymous faults, and COW.
 pub fn announce() {
-    pr_info!("rust-fault: PTE sequencer and anonymous/COW handler active\n");
+    pr_info!("rust-fault: mm-fault/PTE sequencer and anonymous/COW handler active\n");
 }
 
 /// C ABI: sequence `handle_pte_fault` after C classifies the PTE.
@@ -161,6 +198,167 @@ pub unsafe extern "C" fn rust_wp_dispatch(
             pr_err!("rust-fault: unknown WP kind {kind}\n");
             0
         }
+    }
+}
+
+/// C ABI: sequence `do_fault` after C classifies read / COW / shared.
+///
+/// Always frees unused `prealloc_pte`. Sets `*handled` once classify
+/// has inspected `vm_ops`.
+///
+/// # Safety
+///
+/// `vmf` must be the live fault descriptor; mmap or VMA lock held as for
+/// `do_fault`. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_file_dispatch(
+    vmf: *mut bindings::vm_fault,
+    handled: *mut crate::ffi::c_int,
+) -> u32 {
+    if vmf.is_null() || handled.is_null() {
+        return VM_FAULT_OOM;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out = 0u32;
+    // SAFETY: Same lock as `do_fault`; missing file PTE.
+    let kind = unsafe { bindings::rust_file_classify(vmf, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_FILE.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-fault: first file fault sequenced\n");
+    }
+
+    let ret = match kind {
+        FILE_DONE => out,
+        // SAFETY: File VMA with `->fault`; read fault.
+        FILE_READ => unsafe { bindings::rust_do_read_fault(vmf) },
+        // SAFETY: Private file write; COW from the file page.
+        FILE_COW => unsafe { bindings::rust_do_cow_fault(vmf) },
+        // SAFETY: Shared file write.
+        FILE_SHARED => unsafe { bindings::rust_do_shared_fault(vmf) },
+        _ => {
+            pr_err!("rust-fault: unknown file kind {kind}\n");
+            0
+        }
+    };
+    // SAFETY: Matches C `do_fault` freeing unused preallocated PTE.
+    unsafe { bindings::rust_file_free_prealloc(vmf) };
+    ret
+}
+
+/// C ABI: sequence `__handle_mm_fault` after C walks PGD/P4D/PUD/PMD.
+///
+/// Sets `*handled` once page-table setup has run (including OOM).
+///
+/// # Safety
+///
+/// `vmf` must be initialized as in `__handle_mm_fault` (VMA, address,
+/// flags, pgoff, gfp). mmap or VMA lock held. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_handle_mm_fault(
+    vmf: *mut bindings::vm_fault,
+    handled: *mut crate::ffi::c_int,
+) -> u32 {
+    if vmf.is_null() || handled.is_null() {
+        return VM_FAULT_OOM;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: Same lock as `__handle_mm_fault`; allocates P4D/PUD.
+    if unsafe { bindings::rust_mmf_setup(vmf) } != 0 {
+        // SAFETY: `handled` is valid.
+        unsafe { *handled = 1 };
+        return VM_FAULT_OOM;
+    }
+    // Setup mutated `vmf`. C must not re-walk.
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MMF.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-fault: first mm-fault sequenced\n");
+    }
+
+    loop {
+        let mut out = 0u32;
+        // SAFETY: PUD exists; mmap/VMA lock held.
+        let pud_kind = unsafe { bindings::rust_mmf_classify_pud(vmf, &mut out) };
+        match pud_kind {
+            MMF_DONE => return out,
+            MMF_HUGE_PUD => {
+                // SAFETY: Empty PUD that may take a huge mapping.
+                let ret = unsafe { bindings::rust_create_huge_pud(vmf) };
+                if ret & VM_FAULT_FALLBACK == 0 {
+                    return ret;
+                }
+            }
+            MMF_WP_HUGE_PUD => {
+                // SAFETY: Write fault on a transhuge PUD.
+                let ret = unsafe { bindings::rust_wp_huge_pud(vmf) };
+                if ret & VM_FAULT_FALLBACK == 0 {
+                    return ret;
+                }
+            }
+            MMF_CONT => {}
+            _ => {
+                pr_err!("rust-fault: unknown mm-fault PUD kind {pud_kind}\n");
+                return 0;
+            }
+        }
+
+        // SAFETY: PUD handling finished or fell back; allocate PMD.
+        let pmd_alloc = unsafe { bindings::rust_mmf_alloc_pmd(vmf, &mut out) };
+        match pmd_alloc {
+            MMF_DONE => return out,
+            MMF_RETRY_PUD => continue,
+            MMF_CONT => {}
+            _ => {
+                pr_err!("rust-fault: unknown mm-fault PMD alloc {pmd_alloc}\n");
+                return 0;
+            }
+        }
+
+        // SAFETY: PMD pointer is live; classify THP vs PTE.
+        let pmd_kind = unsafe { bindings::rust_mmf_classify_pmd(vmf, &mut out) };
+        return match pmd_kind {
+            MMF_DONE => out,
+            MMF_HUGE_PMD => {
+                // SAFETY: Empty PMD that may take a THP.
+                let ret = unsafe { bindings::rust_create_huge_pmd(vmf) };
+                if ret & VM_FAULT_FALLBACK != 0 {
+                    unsafe { bindings::rust_finish_pte_fault(vmf) }
+                } else {
+                    ret
+                }
+            }
+            // SAFETY: Device-private swap PMD.
+            MMF_DEV_PRIVATE => unsafe { bindings::rust_do_huge_pmd_device_private(vmf) },
+            // SAFETY: uffd-rwp huge PMD.
+            MMF_UFFD_RWP => unsafe { bindings::rust_do_huge_pmd_uffd_rwp(vmf) },
+            // SAFETY: NUMA hinting huge PMD.
+            MMF_NUMA => unsafe { bindings::rust_do_huge_pmd_numa_page(vmf) },
+            MMF_WP_HUGE_PMD => {
+                // SAFETY: Write/unshare on a huge PMD; `orig_pmd` cached.
+                let ret = unsafe { bindings::rust_wp_huge_pmd(vmf) };
+                if ret & VM_FAULT_FALLBACK != 0 {
+                    unsafe { bindings::rust_finish_pte_fault(vmf) }
+                } else {
+                    ret
+                }
+            }
+            // SAFETY: Regular or none PMD; PTE fault.
+            MMF_PTE => unsafe { bindings::rust_finish_pte_fault(vmf) },
+            _ => {
+                pr_err!("rust-fault: unknown mm-fault PMD kind {pmd_kind}\n");
+                0
+            }
+        };
     }
 }
 

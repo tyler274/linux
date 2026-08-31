@@ -6466,11 +6466,83 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
  * If the lock is released, vma may become invalid (for example
  * by other thread calling munmap()).
  */
+#ifdef CONFIG_RUST_FAULT
+int rust_file_classify(struct vm_fault *vmf, vm_fault_t *out)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	vm_fault_t ret;
+
+	*out = 0;
+	/*
+	 * The VMA was not fully populated on mmap() or missing VM_DONTEXPAND
+	 */
+	if (!vma->vm_ops->fault) {
+		vmf->pte = pte_offset_map_lock(vmf->vma->vm_mm, vmf->pmd,
+					       vmf->address, &vmf->ptl);
+		if (unlikely(!vmf->pte))
+			ret = VM_FAULT_SIGBUS;
+		else {
+			/*
+			 * Make sure this is not a temporary clearing of pte
+			 * by holding ptl and checking again. A R/M/W update
+			 * of pte involves: take ptl, clearing the pte so that
+			 * we don't have concurrent modification by hardware
+			 * followed by an update.
+			 */
+			if (unlikely(pte_none(ptep_get(vmf->pte))))
+				ret = VM_FAULT_SIGBUS;
+			else
+				ret = VM_FAULT_NOPAGE;
+
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+		}
+		*out = ret;
+		return RUST_FILE_DONE;
+	}
+	if (!(vmf->flags & FAULT_FLAG_WRITE))
+		return RUST_FILE_READ;
+	if (!(vma->vm_flags & VM_SHARED))
+		return RUST_FILE_COW;
+	return RUST_FILE_SHARED;
+}
+
+vm_fault_t rust_do_read_fault(struct vm_fault *vmf)
+{
+	return do_read_fault(vmf);
+}
+
+vm_fault_t rust_do_cow_fault(struct vm_fault *vmf)
+{
+	return do_cow_fault(vmf);
+}
+
+vm_fault_t rust_do_shared_fault(struct vm_fault *vmf)
+{
+	return do_shared_fault(vmf);
+}
+
+void rust_file_free_prealloc(struct vm_fault *vmf)
+{
+	if (vmf->prealloc_pte) {
+		pte_free(vmf->vma->vm_mm, vmf->prealloc_pte);
+		vmf->prealloc_pte = NULL;
+	}
+}
+#endif
+
 static vm_fault_t do_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *vm_mm = vma->vm_mm;
 	vm_fault_t ret;
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	rust_ret = rust_file_dispatch(vmf, &handled);
+	if (handled)
+		return rust_ret;
+#endif
 
 	/*
 	 * The VMA was not fully populated on mmap() or missing VM_DONTEXPAND
@@ -7092,6 +7164,160 @@ unlock:
 	return 0;
 }
 
+#ifdef CONFIG_RUST_FAULT
+int rust_mmf_setup(struct vm_fault *vmf)
+{
+	struct mm_struct *mm = vmf->vma->vm_mm;
+	unsigned long address = vmf->real_address;
+	pgd_t *pgd;
+	p4d_t *p4d;
+
+	pgd = pgd_offset(mm, address);
+	p4d = p4d_alloc(mm, pgd, address);
+	if (!p4d)
+		return 1;
+	vmf->pud = pud_alloc(mm, p4d, address);
+	return vmf->pud == NULL;
+}
+
+int rust_mmf_classify_pud(struct vm_fault *vmf, vm_fault_t *out)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	vm_flags_t vm_flags = vma->vm_flags;
+	pud_t orig_pud;
+
+	*out = 0;
+	if (pud_none(*vmf->pud) &&
+	    thp_vma_allowable_order(vma, vm_flags, TVA_PAGEFAULT, PUD_ORDER))
+		return RUST_MMF_HUGE_PUD;
+
+	orig_pud = *vmf->pud;
+	barrier();
+	if (pud_trans_huge(orig_pud)) {
+		/*
+		 * TODO once we support anonymous PUDs: NUMA case and
+		 * FAULT_FLAG_UNSHARE handling.
+		 */
+		if ((vmf->flags & FAULT_FLAG_WRITE) && !pud_write(orig_pud))
+			return RUST_MMF_WP_HUGE_PUD;
+		huge_pud_set_accessed(vmf, orig_pud);
+		return RUST_MMF_DONE;
+	}
+	return RUST_MMF_CONT;
+}
+
+int rust_mmf_alloc_pmd(struct vm_fault *vmf, vm_fault_t *out)
+{
+	struct mm_struct *mm = vmf->vma->vm_mm;
+	unsigned long address = vmf->real_address;
+
+	*out = 0;
+	vmf->pmd = pmd_alloc(mm, vmf->pud, address);
+	if (!vmf->pmd) {
+		*out = VM_FAULT_OOM;
+		return RUST_MMF_DONE;
+	}
+	/* Huge pud page fault raced with pmd_alloc? */
+	if (pud_trans_unstable(vmf->pud))
+		return RUST_MMF_RETRY_PUD;
+	return RUST_MMF_CONT;
+}
+
+int rust_mmf_classify_pmd(struct vm_fault *vmf, vm_fault_t *out)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	vm_flags_t vm_flags = vma->vm_flags;
+
+	*out = 0;
+	if (pmd_none(*vmf->pmd) &&
+	    thp_vma_allowable_order(vma, vm_flags, TVA_PAGEFAULT, PMD_ORDER))
+		return RUST_MMF_HUGE_PMD;
+
+	vmf->orig_pmd = pmdp_get_lockless(vmf->pmd);
+	if (pmd_none(vmf->orig_pmd))
+		return RUST_MMF_PTE;
+
+	if (unlikely(!pmd_present(vmf->orig_pmd))) {
+		if (pmd_is_device_private_entry(vmf->orig_pmd))
+			return RUST_MMF_DEV_PRIVATE;
+
+		if (pmd_is_migration_entry(vmf->orig_pmd))
+			pmd_migration_entry_wait(mm, vmf->pmd);
+		return RUST_MMF_DONE;
+	}
+	if (pmd_trans_huge(vmf->orig_pmd)) {
+		if (pmd_protnone(vmf->orig_pmd) && vma_is_accessible(vma)) {
+			if (userfaultfd_huge_pmd_rwp(vma, vmf->orig_pmd))
+				return RUST_MMF_UFFD_RWP;
+			return RUST_MMF_NUMA;
+		}
+
+		if ((vmf->flags & (FAULT_FLAG_WRITE | FAULT_FLAG_UNSHARE)) &&
+		    !pmd_write(vmf->orig_pmd))
+			return RUST_MMF_WP_HUGE_PMD;
+		vmf->ptl = pmd_lock(mm, vmf->pmd);
+		if (!huge_pmd_set_accessed(vmf))
+			fix_spurious_fault(vmf, PGTABLE_LEVEL_PMD);
+		spin_unlock(vmf->ptl);
+		return RUST_MMF_DONE;
+	}
+
+	return RUST_MMF_PTE;
+}
+
+vm_fault_t rust_create_huge_pud(struct vm_fault *vmf)
+{
+	return create_huge_pud(vmf);
+}
+
+vm_fault_t rust_wp_huge_pud(struct vm_fault *vmf)
+{
+	pud_t orig_pud = *vmf->pud;
+
+	barrier();
+	return wp_huge_pud(vmf, orig_pud);
+}
+
+vm_fault_t rust_create_huge_pmd(struct vm_fault *vmf)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	return create_huge_pmd(vmf);
+#else
+	return VM_FAULT_FALLBACK;
+#endif
+}
+
+vm_fault_t rust_wp_huge_pmd(struct vm_fault *vmf)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	return wp_huge_pmd(vmf);
+#else
+	return VM_FAULT_FALLBACK;
+#endif
+}
+
+vm_fault_t rust_do_huge_pmd_device_private(struct vm_fault *vmf)
+{
+	return do_huge_pmd_device_private(vmf);
+}
+
+vm_fault_t rust_do_huge_pmd_uffd_rwp(struct vm_fault *vmf)
+{
+	return do_huge_pmd_uffd_rwp(vmf);
+}
+
+vm_fault_t rust_do_huge_pmd_numa_page(struct vm_fault *vmf)
+{
+	return do_huge_pmd_numa_page(vmf);
+}
+
+vm_fault_t rust_finish_pte_fault(struct vm_fault *vmf)
+{
+	return handle_pte_fault(vmf);
+}
+#endif
+
 /*
  * On entry, we hold either the VMA lock or the mmap_lock
  * (see FAULT_FLAG_VMA_LOCK).  If VM_FAULT_RETRY is set in
@@ -7114,6 +7340,14 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	pgd_t *pgd;
 	p4d_t *p4d;
 	vm_fault_t ret;
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	rust_ret = rust_handle_mm_fault(&vmf, &handled);
+	if (handled)
+		return rust_ret;
+#endif
 
 	pgd = pgd_offset(mm, address);
 	p4d = p4d_alloc(mm, pgd, address);

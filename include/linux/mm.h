@@ -4327,6 +4327,21 @@ unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
 #define RUST_WP_SHARED		2
 #define RUST_WP_REUSE		3
 #define RUST_WP_COPY		4
+#define RUST_FILE_DONE		0
+#define RUST_FILE_READ		1
+#define RUST_FILE_COW		2
+#define RUST_FILE_SHARED	3
+#define RUST_MMF_DONE		0
+#define RUST_MMF_CONT		1
+#define RUST_MMF_RETRY_PUD	2
+#define RUST_MMF_HUGE_PUD	3
+#define RUST_MMF_WP_HUGE_PUD	4
+#define RUST_MMF_HUGE_PMD	5
+#define RUST_MMF_DEV_PRIVATE	6
+#define RUST_MMF_UFFD_RWP	7
+#define RUST_MMF_NUMA		8
+#define RUST_MMF_WP_HUGE_PMD	9
+#define RUST_MMF_PTE		10
 vm_fault_t rust_handle_pte_fault(struct vm_fault *vmf, int *handled);
 int rust_pte_classify(struct vm_fault *vmf, vm_fault_t *out);
 int rust_vma_is_anonymous(struct vm_fault *vmf);
@@ -4357,6 +4372,25 @@ int rust_wp_copy_user(struct vm_fault *vmf, struct folio *new_folio,
 		      vm_fault_t *out);
 void rust_wp_put_old(struct vm_fault *vmf);
 vm_fault_t rust_wp_install_folio(struct vm_fault *vmf, struct folio *new_folio);
+vm_fault_t rust_file_dispatch(struct vm_fault *vmf, int *handled);
+int rust_file_classify(struct vm_fault *vmf, vm_fault_t *out);
+vm_fault_t rust_do_read_fault(struct vm_fault *vmf);
+vm_fault_t rust_do_cow_fault(struct vm_fault *vmf);
+vm_fault_t rust_do_shared_fault(struct vm_fault *vmf);
+void rust_file_free_prealloc(struct vm_fault *vmf);
+vm_fault_t rust_handle_mm_fault(struct vm_fault *vmf, int *handled);
+int rust_mmf_setup(struct vm_fault *vmf);
+int rust_mmf_classify_pud(struct vm_fault *vmf, vm_fault_t *out);
+int rust_mmf_alloc_pmd(struct vm_fault *vmf, vm_fault_t *out);
+int rust_mmf_classify_pmd(struct vm_fault *vmf, vm_fault_t *out);
+vm_fault_t rust_create_huge_pud(struct vm_fault *vmf);
+vm_fault_t rust_wp_huge_pud(struct vm_fault *vmf);
+vm_fault_t rust_create_huge_pmd(struct vm_fault *vmf);
+vm_fault_t rust_wp_huge_pmd(struct vm_fault *vmf);
+vm_fault_t rust_do_huge_pmd_device_private(struct vm_fault *vmf);
+vm_fault_t rust_do_huge_pmd_uffd_rwp(struct vm_fault *vmf);
+vm_fault_t rust_do_huge_pmd_numa_page(struct vm_fault *vmf);
+vm_fault_t rust_finish_pte_fault(struct vm_fault *vmf);
 #endif
 
 /* truncate.c */
