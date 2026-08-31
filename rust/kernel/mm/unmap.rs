@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Userspace VA search and mmap/munmap dispatch when `CONFIG_RUST_MMAP=y`.
+//! Userspace VA search and mmap/munmap/brk dispatch when `CONFIG_RUST_MMAP=y`.
 //!
 //! Replaces the maple-tree walk in `unmapped_area()` / `unmapped_area_topdown()`
 //! with a first-fit (bottom-up or top-down) walk of existing VMAs, and
-//! sequences `do_mmap` (prepare vs `mmap_region`) and `do_vmi_munmap`
-//! (range check vs maple-tree unmap). Maple-tree storage and the
-//! `mmap_region` body stay in C. The mmap lock is already held by the C
-//! caller.
+//! sequences `do_mmap` (prepare vs `mmap_region`), `do_vmi_munmap` (range
+//! check vs maple-tree unmap), and `do_brk_flags` (expand vs new anonymous
+//! VMA). Maple-tree storage and the `mmap_region` body stay in C. The mmap
+//! lock is already held by the C caller.
 
 use crate::{
     bindings,
@@ -38,8 +38,18 @@ const DOMMAP_DONE: i32 = 0;
 /// Flags and VA chosen; install via `mmap_region`.
 const DOMMAP_REGION: i32 = 1;
 
+/// Matches `RUST_BRK_*` in `include/linux/mm.h`.
+const BRK_DONE: i32 = 0;
+/// Limits passed; try expand or new.
+const BRK_CONT: i32 = 1;
+/// Need a new anonymous VMA.
+const BRK_NEW: i32 = 2;
+/// Merge or new succeeded; account the mapping.
+const BRK_ACCT: i32 = 3;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
+static N_BRK: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -226,9 +236,9 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
     None
 }
 
-/// Log that Rust is serving `vm_unmapped_area` and mmap/munmap dispatch.
+/// Log that Rust is serving `vm_unmapped_area` and mmap/munmap/brk dispatch.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -403,4 +413,77 @@ pub unsafe extern "C" fn rust_dommap_dispatch(
             EINVAL.to_errno() as c_ulong
         }
     }
+}
+
+/// C ABI: sequence `do_brk_flags` after C checks limits.
+///
+/// Sets `*handled` once prepare has run. Expand vs new VMA and
+/// accounting stay in C helpers.
+///
+/// # Safety
+///
+/// mmap write lock held as for `do_brk_flags`. `vmi` and `vma_flags`
+/// must be live. `vma` may be null. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_brk_dispatch(
+    vmi: *mut bindings::vma_iterator,
+    mut vma: *mut bindings::vm_area_struct,
+    addr: c_ulong,
+    len: c_ulong,
+    vma_flags: *mut bindings::vma_flags_t,
+    handled: *mut c_int,
+) -> c_int {
+    if vmi.is_null() || vma_flags.is_null() || handled.is_null() {
+        return ENOMEM.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: Same lock as `do_brk_flags`; `vma_flags` is the live bitmap.
+    let kind = unsafe { bindings::rust_brk_prepare(vma_flags, len, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_BRK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first brk sequenced\n");
+    }
+
+    if kind == BRK_DONE {
+        return out;
+    }
+    if kind != BRK_CONT {
+        pr_err!("rust-mmap: unknown brk prepare kind {kind}\n");
+        return ENOMEM.to_errno();
+    }
+
+    // SAFETY: Limits passed; try to grow the previous VMA.
+    let kind = unsafe { bindings::rust_brk_expand(vmi, vma, addr, len, vma_flags, &mut out) };
+    match kind {
+        BRK_DONE => return out,
+        BRK_ACCT => {}
+        BRK_NEW => {
+            // SAFETY: Need a new anonymous VMA; may advance `vmi`.
+            let kind = unsafe {
+                bindings::rust_brk_new(vmi, &mut vma, addr, len, vma_flags, &mut out)
+            };
+            if kind == BRK_DONE {
+                return out;
+            }
+            if kind != BRK_ACCT {
+                pr_err!("rust-mmap: unknown brk new kind {kind}\n");
+                return ENOMEM.to_errno();
+            }
+        }
+        _ => {
+            pr_err!("rust-mmap: unknown brk expand kind {kind}\n");
+            return ENOMEM.to_errno();
+        }
+    }
+
+    // SAFETY: Expand or new succeeded; `vma` is the live mapping.
+    unsafe { bindings::rust_brk_account(vma, len, vma_flags) };
+    0
 }

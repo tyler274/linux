@@ -4342,6 +4342,22 @@ unsigned long rust_dommap_region(struct file *file, unsigned long addr,
 void rust_dommap_populate(unsigned long addr, unsigned long flags,
 			  vma_flags_t *vma_flags, unsigned long len,
 			  unsigned long *populate);
+#define RUST_BRK_DONE		0
+#define RUST_BRK_CONT		1
+#define RUST_BRK_NEW		2
+#define RUST_BRK_ACCT		3
+int rust_brk_dispatch(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		      unsigned long addr, unsigned long len,
+		      vma_flags_t *vma_flags, int *handled);
+int rust_brk_prepare(vma_flags_t *vma_flags, unsigned long len, int *out);
+int rust_brk_expand(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		    unsigned long addr, unsigned long len,
+		    vma_flags_t *vma_flags, int *out);
+int rust_brk_new(struct vma_iterator *vmi, struct vm_area_struct **vma,
+		 unsigned long addr, unsigned long len, vma_flags_t *vma_flags,
+		 int *out);
+void rust_brk_account(struct vm_area_struct *vma, unsigned long len,
+		      vma_flags_t *vma_flags);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

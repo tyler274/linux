@@ -3037,48 +3037,88 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
  *
  * Returns: %0 on success, or otherwise an error.
  */
-int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
-		 unsigned long addr, unsigned long len, vma_flags_t vma_flags)
+#define BRK_DONE	0
+#define BRK_CONT	1
+#define BRK_NEW		2
+#define BRK_ACCT	3
+
+static int brk_prepare(vma_flags_t *vma_flags, unsigned long len, int *out)
 {
 	struct mm_struct *mm = current->mm;
-	const pgoff_t pgoff = addr >> PAGE_SHIFT;
+
+	*out = 0;
 
 	/*
 	 * Check against address space limits by the changed size
 	 * Note: This happens *after* clearing old mappings in some code paths.
 	 */
-	vma_flags_set_mask(&vma_flags, VMA_DATA_DEFAULT_FLAGS);
-	vma_flags_set(&vma_flags, VMA_ACCOUNT_BIT);
-	vma_flags_set_mask(&vma_flags, mm->def_vma_flags);
+	vma_flags_set_mask(vma_flags, VMA_DATA_DEFAULT_FLAGS);
+	vma_flags_set(vma_flags, VMA_ACCOUNT_BIT);
+	vma_flags_set_mask(vma_flags, mm->def_vma_flags);
 
-	vma_flags = ksm_vma_flags(mm, NULL, vma_flags);
-	if (!may_expand_vm(mm, &vma_flags, len >> PAGE_SHIFT))
-		return -ENOMEM;
+	*vma_flags = ksm_vma_flags(mm, NULL, *vma_flags);
+	if (!may_expand_vm(mm, vma_flags, len >> PAGE_SHIFT)) {
+		*out = -ENOMEM;
+		return BRK_DONE;
+	}
 
-	if (mm->map_count > get_sysctl_max_map_count())
-		return -ENOMEM;
+	if (mm->map_count > get_sysctl_max_map_count()) {
+		*out = -ENOMEM;
+		return BRK_DONE;
+	}
 
-	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
-		return -ENOMEM;
+	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT)) {
+		*out = -ENOMEM;
+		return BRK_DONE;
+	}
+
+	return BRK_CONT;
+}
+
+static int brk_expand(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		      unsigned long addr, unsigned long len,
+		      vma_flags_t *vma_flags, int *out)
+{
+	struct mm_struct *mm = current->mm;
+	const pgoff_t pgoff = addr >> PAGE_SHIFT;
+
+	*out = 0;
+	if (!(vma && vma->vm_end == addr))
+		return BRK_NEW;
 
 	/*
 	 * Expand the existing vma if possible; Note that singular lists do not
 	 * occur after forking, so the expand will only happen on new VMAs.
 	 */
-	if (vma && vma->vm_end == addr) {
-		VMG_STATE(vmg, mm, vmi, addr, addr + len, vma_flags, pgoff, pgoff);
+	{
+		VMG_STATE(vmg, mm, vmi, addr, addr + len, *vma_flags, pgoff,
+			  pgoff);
 
 		vmg.prev = vma;
 		/* vmi is positioned at prev, which this mode expects. */
 		vmg.just_expand = true;
 
 		if (vma_merge_new_range(&vmg))
-			goto out;
-		else if (vmg_nomem(&vmg))
-			goto unacct_fail;
+			return BRK_ACCT;
+		if (vmg_nomem(&vmg)) {
+			vm_unacct_memory(len >> PAGE_SHIFT);
+			*out = -ENOMEM;
+			return BRK_DONE;
+		}
 	}
+	return BRK_NEW;
+}
 
-	if (vma)
+static int brk_new(struct vma_iterator *vmi, struct vm_area_struct **vmap,
+		   unsigned long addr, unsigned long len, vma_flags_t *vma_flags,
+		   int *out)
+{
+	struct mm_struct *mm = current->mm;
+	const pgoff_t pgoff = addr >> PAGE_SHIFT;
+	struct vm_area_struct *vma;
+
+	*out = 0;
+	if (*vmap)
 		vma_iter_next_range(vmi);
 	/* create a vma struct for an anonymous mapping */
 	vma = vm_area_alloc(mm);
@@ -3087,29 +3127,100 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 
 	vma_set_anonymous(vma);
 	vma_set_range(vma, addr, addr + len, pgoff, pgoff);
-	vma->flags = vma_flags;
-	vma->vm_page_prot = vm_get_page_prot(vma_flags_to_legacy(vma_flags));
+	vma->flags = *vma_flags;
+	vma->vm_page_prot = vm_get_page_prot(vma_flags_to_legacy(*vma_flags));
 	vma_start_write(vma);
 	if (vma_iter_store_gfp(vmi, vma, GFP_KERNEL))
 		goto mas_store_fail;
 
 	mm->map_count++;
 	validate_mm(mm);
-out:
-	perf_event_mmap(vma);
-	mm->total_vm += len >> PAGE_SHIFT;
-	mm->data_vm += len >> PAGE_SHIFT;
-	if (vma_flags_test(&vma_flags, VMA_LOCKED_BIT))
-		mm->locked_vm += (len >> PAGE_SHIFT);
-	if (pgtable_supports_soft_dirty())
-		vma_set_flags(vma, VMA_SOFTDIRTY_BIT);
-	return 0;
+	*vmap = vma;
+	return BRK_ACCT;
 
 mas_store_fail:
 	vm_area_free(vma);
 unacct_fail:
 	vm_unacct_memory(len >> PAGE_SHIFT);
-	return -ENOMEM;
+	*out = -ENOMEM;
+	return BRK_DONE;
+}
+
+static void brk_account(struct vm_area_struct *vma, unsigned long len,
+			vma_flags_t *vma_flags)
+{
+	struct mm_struct *mm = current->mm;
+
+	perf_event_mmap(vma);
+	mm->total_vm += len >> PAGE_SHIFT;
+	mm->data_vm += len >> PAGE_SHIFT;
+	if (vma_flags_test(vma_flags, VMA_LOCKED_BIT))
+		mm->locked_vm += (len >> PAGE_SHIFT);
+	if (pgtable_supports_soft_dirty())
+		vma_set_flags(vma, VMA_SOFTDIRTY_BIT);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_brk_prepare(vma_flags_t *vma_flags, unsigned long len, int *out)
+{
+	return brk_prepare(vma_flags, len, out);
+}
+
+int rust_brk_expand(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		    unsigned long addr, unsigned long len,
+		    vma_flags_t *vma_flags, int *out)
+{
+	return brk_expand(vmi, vma, addr, len, vma_flags, out);
+}
+
+int rust_brk_new(struct vma_iterator *vmi, struct vm_area_struct **vma,
+		 unsigned long addr, unsigned long len, vma_flags_t *vma_flags,
+		 int *out)
+{
+	return brk_new(vmi, vma, addr, len, vma_flags, out);
+}
+
+void rust_brk_account(struct vm_area_struct *vma, unsigned long len,
+		      vma_flags_t *vma_flags)
+{
+	brk_account(vma, len, vma_flags);
+}
+#endif
+
+static int finish_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+			    unsigned long addr, unsigned long len,
+			    vma_flags_t vma_flags)
+{
+	int out = 0;
+	int kind;
+
+	kind = brk_prepare(&vma_flags, len, &out);
+	if (kind == BRK_DONE)
+		return out;
+	kind = brk_expand(vmi, vma, addr, len, &vma_flags, &out);
+	if (kind == BRK_DONE)
+		return out;
+	if (kind == BRK_NEW) {
+		kind = brk_new(vmi, &vma, addr, len, &vma_flags, &out);
+		if (kind == BRK_DONE)
+			return out;
+	}
+	brk_account(vma, len, &vma_flags);
+	return 0;
+}
+
+int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		 unsigned long addr, unsigned long len, vma_flags_t vma_flags)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_brk_dispatch(vmi, vma, addr, len, &vma_flags, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_brk_flags(vmi, vma, addr, len, vma_flags);
 }
 
 /**
