@@ -4505,6 +4505,124 @@ static bool wp_can_reuse_anon_folio(struct folio *folio,
  * FAULT_FLAG_VMA_LOCK) and pte both mapped and locked. We return with
  * the same lock still held, but pte unmapped and unlocked.
  */
+#ifdef CONFIG_RUST_FAULT
+int rust_wp_classify(struct vm_fault *vmf, vm_fault_t *out)
+{
+	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
+	struct vm_area_struct *vma = vmf->vma;
+	struct folio *folio = NULL;
+	pte_t pte;
+
+	*out = 0;
+
+	if (likely(!unshare)) {
+		if (userfaultfd_pte_wp(vma, ptep_get(vmf->pte))) {
+			if (!userfaultfd_wp_async(vma)) {
+				pte_unmap_unlock(vmf->pte, vmf->ptl);
+				*out = handle_userfault(vmf, VM_UFFD_WP);
+				return RUST_WP_DONE;
+			}
+
+			/*
+			 * Nothing needed (cache flush, TLB invalidations,
+			 * etc.) because we're only removing the uffd-wp bit,
+			 * which is completely invisible to the user.
+			 */
+			pte = pte_clear_uffd(ptep_get(vmf->pte));
+
+			set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
+			/*
+			 * Update this to be prepared for following up CoW
+			 * handling
+			 */
+			vmf->orig_pte = pte;
+		}
+
+		/*
+		 * Userfaultfd write-protect can defer flushes. Ensure the TLB
+		 * is flushed in this case before copying.
+		 */
+		if (unlikely(userfaultfd_wp(vmf->vma) &&
+			     mm_tlb_flush_pending(vmf->vma->vm_mm)))
+			flush_tlb_page(vmf->vma, vmf->address);
+	}
+
+	vmf->page = vm_normal_page(vma, vmf->address, vmf->orig_pte);
+
+	if (vmf->page)
+		folio = page_folio(vmf->page);
+
+	/*
+	 * Shared mapping: we are guaranteed to have VM_WRITE and
+	 * FAULT_FLAG_WRITE set at this point.
+	 */
+	if (vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) {
+		/*
+		 * VM_MIXEDMAP !pfn_valid() case, or VM_SOFTDIRTY clear on a
+		 * VM_PFNMAP VMA. FS DAX also wants ops->pfn_mkwrite called.
+		 *
+		 * We should not cow pages in a shared writeable mapping.
+		 * Just mark the pages writable and/or call ops->pfn_mkwrite.
+		 */
+		if (!vmf->page || is_fsdax_page(vmf->page)) {
+			vmf->page = NULL;
+			return RUST_WP_SHARED_PFN;
+		}
+		return RUST_WP_SHARED;
+	}
+
+	/*
+	 * Private mapping: create an exclusive anonymous page copy if reuse
+	 * is impossible. We might miss VM_WRITE for FOLL_FORCE handling.
+	 *
+	 * If we encounter a page that is marked exclusive, we must reuse
+	 * the page without further checks.
+	 */
+	if (folio && folio_test_anon(folio) &&
+	    (PageAnonExclusive(vmf->page) || wp_can_reuse_anon_folio(folio, vma))) {
+		if (!PageAnonExclusive(vmf->page))
+			SetPageAnonExclusive(vmf->page);
+		if (unlikely(unshare)) {
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			return RUST_WP_DONE;
+		}
+		return RUST_WP_REUSE;
+	}
+	/*
+	 * Ok, we need to copy. Oh, well..
+	 */
+	if (folio)
+		folio_get(folio);
+
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+#ifdef CONFIG_KSM
+	if (folio && folio_test_ksm(folio))
+		count_vm_event(COW_KSM);
+#endif
+	return RUST_WP_COPY;
+}
+
+vm_fault_t rust_wp_pfn_shared(struct vm_fault *vmf)
+{
+	return wp_pfn_shared(vmf);
+}
+
+vm_fault_t rust_wp_page_shared(struct vm_fault *vmf)
+{
+	return wp_page_shared(vmf, page_folio(vmf->page));
+}
+
+void rust_wp_reuse(struct vm_fault *vmf)
+{
+	wp_page_reuse(vmf, vmf->page ? page_folio(vmf->page) : NULL);
+}
+
+vm_fault_t rust_wp_do_copy(struct vm_fault *vmf)
+{
+	return wp_page_copy(vmf);
+}
+#endif
+
 static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	__releases(vmf->ptl)
 {
@@ -4512,6 +4630,14 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio = NULL;
 	pte_t pte;
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	rust_ret = rust_wp_dispatch(vmf, &handled);
+	if (handled)
+		return rust_ret;
+#endif
 
 	if (likely(!unshare)) {
 		if (userfaultfd_pte_wp(vma, ptep_get(vmf->pte))) {
@@ -5547,15 +5673,60 @@ static void map_anon_folio_pte_pf(struct folio *folio, pte_t *pte,
 }
 
 #ifdef CONFIG_RUST_FAULT
-int rust_anon_write_prepare(struct vm_fault *vmf, vm_fault_t *out)
+int rust_anon_pte_alloc(struct vm_fault *vmf, vm_fault_t *out)
 {
 	*out = 0;
 	if (pte_alloc(vmf->vma->vm_mm, vmf->pmd)) {
 		*out = VM_FAULT_OOM;
 		return 1;
 	}
+	return 0;
+}
+
+int rust_anon_write_prepare(struct vm_fault *vmf, vm_fault_t *out)
+{
 	*out = vmf_anon_prepare(vmf);
 	return *out != 0;
+}
+
+int rust_anon_use_zeropage(struct vm_fault *vmf)
+{
+	return !(vmf->flags & FAULT_FLAG_WRITE) &&
+	       !mm_forbids_zeropage(vmf->vma->vm_mm);
+}
+
+vm_fault_t rust_anon_install_zeropage(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long addr = vmf->address;
+	vm_fault_t ret = 0;
+	pte_t entry;
+
+	entry = pte_mkspecial(pfn_pte(zero_pfn(vmf->address),
+				      vma->vm_page_prot));
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+				       &vmf->ptl);
+	if (!vmf->pte)
+		goto unlock;
+	if (vmf_pte_changed(vmf)) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock;
+	}
+	ret = check_stable_address_space(vma->vm_mm);
+	if (ret)
+		goto unlock;
+	if (userfaultfd_missing(vma)) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
+	if (vmf_orig_pte_uffd_wp(vmf))
+		entry = pte_mkuffd(entry);
+	set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+	update_mmu_cache(vma, addr, vmf->pte);
+unlock:
+	if (vmf->pte)
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return ret;
 }
 
 struct folio *rust_anon_alloc_folio(struct vm_fault *vmf)
@@ -5622,7 +5793,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 #ifdef CONFIG_RUST_FAULT
-	if ((vmf->flags & FAULT_FLAG_WRITE) && !userfaultfd_armed(vma)) {
+	if (!userfaultfd_armed(vma)) {
 		int handled = 0;
 
 		ret = rust_do_anonymous_page(vmf, &handled);
@@ -6689,6 +6860,130 @@ static void fix_spurious_fault(struct vm_fault *vmf,
 							 vmf->pmd);
 	}
 }
+
+#ifdef CONFIG_RUST_FAULT
+int rust_pte_classify(struct vm_fault *vmf, vm_fault_t *out)
+{
+	pte_t entry;
+	pmd_t dummy_pmdval;
+
+	*out = 0;
+
+	if (unlikely(pmd_none(*vmf->pmd))) {
+		/*
+		 * Leave __pte_alloc() until later: because vm_ops->fault may
+		 * want to allocate huge page, and if we expose page table
+		 * for an instant, it will be difficult to retract from
+		 * concurrent faults and from rmap lookups.
+		 */
+		vmf->pte = NULL;
+		vmf->flags &= ~FAULT_FLAG_ORIG_PTE_VALID;
+	} else {
+		/*
+		 * A regular pmd is established and it can't morph into a huge
+		 * pmd by anon khugepaged, since that takes mmap_lock in write
+		 * mode; but shmem or file collapse to THP could still morph
+		 * it into a huge pmd: just retry later if so.
+		 *
+		 * Use the maywrite version to indicate that vmf->pte may be
+		 * modified, but since we will use pte_same() to detect the
+		 * change of the !pte_none() entry, there is no need to recheck
+		 * the pmdval. Here we choose to pass a dummy variable instead
+		 * of NULL, which helps new user think about why this place is
+		 * special.
+		 */
+		vmf->pte = pte_offset_map_rw_nolock(vmf->vma->vm_mm, vmf->pmd,
+						    vmf->address, &dummy_pmdval,
+						    &vmf->ptl);
+		if (unlikely(!vmf->pte))
+			return RUST_PTE_DONE;
+		vmf->orig_pte = ptep_get_lockless(vmf->pte);
+		vmf->flags |= FAULT_FLAG_ORIG_PTE_VALID;
+
+		if (pte_none(vmf->orig_pte)) {
+			pte_unmap(vmf->pte);
+			vmf->pte = NULL;
+		}
+	}
+
+	if (!vmf->pte)
+		return RUST_PTE_MISSING;
+
+	if (!pte_present(vmf->orig_pte))
+		return RUST_PTE_SWAP;
+
+	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
+		/*
+		 * RWP-protected PTEs are protnone plus the uffd bit. On a
+		 * VM_UFFD_RWP VMA, a protnone PTE without the uffd bit is
+		 * NUMA hinting and must still fall through to do_numa_page().
+		 */
+		if (userfaultfd_pte_rwp(vmf->vma, vmf->orig_pte))
+			return RUST_PTE_RWP;
+		return RUST_PTE_NUMA;
+	}
+
+	spin_lock(vmf->ptl);
+	entry = vmf->orig_pte;
+	if (unlikely(!pte_same(ptep_get(vmf->pte), entry))) {
+		update_mmu_tlb(vmf->vma, vmf->address, vmf->pte);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return RUST_PTE_DONE;
+	}
+	if (vmf->flags & (FAULT_FLAG_WRITE | FAULT_FLAG_UNSHARE)) {
+		if (!pte_write(entry))
+			return RUST_PTE_WP;
+		else if (likely(vmf->flags & FAULT_FLAG_WRITE))
+			entry = pte_mkdirty(entry);
+	}
+	entry = pte_mkyoung(entry);
+	if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
+				  vmf->flags & FAULT_FLAG_WRITE))
+		update_mmu_cache_range(vmf, vmf->vma, vmf->address,
+				       vmf->pte, 1);
+	else
+		fix_spurious_fault(vmf, PGTABLE_LEVEL_PTE);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return RUST_PTE_DONE;
+}
+
+int rust_vma_is_anonymous(struct vm_fault *vmf)
+{
+	return vma_is_anonymous(vmf->vma);
+}
+
+vm_fault_t rust_do_missing_anon(struct vm_fault *vmf)
+{
+	return do_anonymous_page(vmf);
+}
+
+vm_fault_t rust_do_missing_file(struct vm_fault *vmf)
+{
+	return do_fault(vmf);
+}
+
+vm_fault_t rust_do_swap_page(struct vm_fault *vmf)
+{
+	return do_swap_page(vmf);
+}
+
+vm_fault_t rust_do_uffd_rwp(struct vm_fault *vmf)
+{
+	return do_uffd_rwp(vmf);
+}
+
+vm_fault_t rust_do_numa_page(struct vm_fault *vmf)
+{
+	return do_numa_page(vmf);
+}
+
+vm_fault_t rust_do_wp_page(struct vm_fault *vmf)
+	__releases(vmf->ptl)
+{
+	return do_wp_page(vmf);
+}
+#endif
+
 /*
  * These routines also need to handle stuff like marking pages dirty
  * and/or accessed for architectures that don't do it in hardware (most
@@ -6708,6 +7003,14 @@ static void fix_spurious_fault(struct vm_fault *vmf,
 static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 {
 	pte_t entry;
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	rust_ret = rust_handle_pte_fault(vmf, &handled);
+	if (handled)
+		return rust_ret;
+#endif
 
 	if (unlikely(pmd_none(*vmf->pmd))) {
 		/*

@@ -4316,8 +4316,37 @@ extern unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info);
 unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
 #endif
 #ifdef CONFIG_RUST_FAULT
+#define RUST_PTE_DONE		0
+#define RUST_PTE_MISSING	1
+#define RUST_PTE_SWAP		2
+#define RUST_PTE_RWP		3
+#define RUST_PTE_NUMA		4
+#define RUST_PTE_WP		5
+#define RUST_WP_DONE		0
+#define RUST_WP_SHARED_PFN	1
+#define RUST_WP_SHARED		2
+#define RUST_WP_REUSE		3
+#define RUST_WP_COPY		4
+vm_fault_t rust_handle_pte_fault(struct vm_fault *vmf, int *handled);
+int rust_pte_classify(struct vm_fault *vmf, vm_fault_t *out);
+int rust_vma_is_anonymous(struct vm_fault *vmf);
+vm_fault_t rust_do_missing_anon(struct vm_fault *vmf);
+vm_fault_t rust_do_missing_file(struct vm_fault *vmf);
+vm_fault_t rust_do_swap_page(struct vm_fault *vmf);
+vm_fault_t rust_do_uffd_rwp(struct vm_fault *vmf);
+vm_fault_t rust_do_numa_page(struct vm_fault *vmf);
+vm_fault_t rust_do_wp_page(struct vm_fault *vmf);
+vm_fault_t rust_wp_dispatch(struct vm_fault *vmf, int *handled);
+int rust_wp_classify(struct vm_fault *vmf, vm_fault_t *out);
+vm_fault_t rust_wp_pfn_shared(struct vm_fault *vmf);
+vm_fault_t rust_wp_page_shared(struct vm_fault *vmf);
+void rust_wp_reuse(struct vm_fault *vmf);
+vm_fault_t rust_wp_do_copy(struct vm_fault *vmf);
 vm_fault_t rust_do_anonymous_page(struct vm_fault *vmf, int *handled);
+int rust_anon_pte_alloc(struct vm_fault *vmf, vm_fault_t *out);
 int rust_anon_write_prepare(struct vm_fault *vmf, vm_fault_t *out);
+int rust_anon_use_zeropage(struct vm_fault *vmf);
+vm_fault_t rust_anon_install_zeropage(struct vm_fault *vmf);
 struct folio *rust_anon_alloc_folio(struct vm_fault *vmf);
 void rust_anon_folio_uptodate(struct folio *folio);
 vm_fault_t rust_anon_install_folio(struct vm_fault *vmf, struct folio *folio);

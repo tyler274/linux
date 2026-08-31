@@ -215,13 +215,15 @@ config RUST_MMAP
 	  If unsure, say N.
 
 config RUST_FAULT
-	bool "Rust anonymous write-fault handler (EXPERIMENTAL)"
+	bool "Rust page-fault sequencer (EXPERIMENTAL)"
 	depends on RUST && EXPERT && MMU
 	help
-	  Serve private anonymous write faults and copy-on-write from
-	  Rust. Page-table install, rmap, and the zero-page read path
-	  stay in C. File, swap, THP, and userfaultfd faults also stay
-	  in C.
+	  Serve PTE fault dispatch from Rust (missing, swap, NUMA,
+	  uffd-rwp, write-protect, access flags). Private anonymous
+	  read (zero-page) and write faults and copy-on-write are
+	  sequenced in Rust, including write-protect reuse vs copy.
+	  Page-table lookup, arch PTE encoding, rmap, and the
+	  file/swap/THP/userfaultfd bodies stay in C.
 
 	  If unsure, say N.
 
