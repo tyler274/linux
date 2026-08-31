@@ -192,6 +192,18 @@ config RUST_BUDDY
 
 	  If unsure, say N.
 
+config RUST_VMALLOC
+	bool "Rust vmalloc (EXPERIMENTAL, replaces mm/vmalloc.c)"
+	depends on RUST && EXPERT && MMU
+	help
+	  Replace mm/vmalloc.c with a Rust virtual-address allocator.
+	  vmalloc/vfree/vmap/get_vm_area and the percpu vm areas are
+	  served from Rust. Page-table map/unmap stays in C (architecture
+	  PTE encoding). Pages come from the Rust buddy when
+	  CONFIG_RUST_BUDDY=y, otherwise the C page allocator.
+
+	  If unsure, say N.
+
 config KVFREE_RCU_BATCHED
 	def_bool y
 	depends on !SLUB_TINY && !TINY_RCU

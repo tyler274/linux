@@ -358,6 +358,28 @@ pub fn alloc(order: u32, gfp: Flags) -> *mut bindings::page {
     ptr::null_mut()
 }
 
+/// C ABI used by `mm/rust_vmalloc.c`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_buddy_alloc_page(gfp: u32, _nid: i32) -> *mut bindings::page {
+    alloc(0, crate::alloc::Flags(gfp))
+}
+
+/// C ABI used by `mm/rust_vmalloc.c`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_buddy_free_page(page: *mut bindings::page) {
+    if page.is_null() {
+        return;
+    }
+    // SAFETY: Live page from the C or Rust buddy.
+    if unsafe { owns(page) } {
+        // SAFETY: `owns` confirmed this is a stolen span page.
+        unsafe { free(page, 0) };
+        return;
+    }
+    // SAFETY: Foreign order-0 page from `alloc_pages`.
+    unsafe { bindings::__free_pages(page, 0) };
+}
+
 /// Return a block previously obtained from [`alloc`].
 ///
 /// # Safety

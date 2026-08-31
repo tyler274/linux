@@ -9,6 +9,8 @@ pub mod kbox;
 pub mod kvec;
 pub mod layout;
 pub mod mi;
+#[cfg(CONFIG_RUST_VMALLOC)]
+pub mod vmalloc;
 
 pub use self::kbox::Box;
 pub use self::kbox::KBox;

@@ -107,6 +107,8 @@ unsafe impl Allocator for MiKmalloc {
 pub unsafe extern "C" fn rust_mi_init() {
     #[cfg(CONFIG_RUST_BUDDY)]
     crate::alloc::buddy::init(crate::alloc::flags::GFP_KERNEL);
+    #[cfg(CONFIG_RUST_VMALLOC)]
+    crate::alloc::vmalloc::announce();
 }
 
 /// Allocate `size` bytes (C `kmalloc` backend).

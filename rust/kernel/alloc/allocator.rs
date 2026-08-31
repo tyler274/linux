@@ -77,7 +77,7 @@ impl ReallocFunc {
     #[cfg(not(CONFIG_SLAB_MIMALLOC))]
     const KREALLOC: Self = Self(bindings::krealloc_node_align);
 
-    // INVARIANT: `vrealloc_node_align` satisfies the type invariants.
+    #[cfg(not(CONFIG_RUST_VMALLOC))]
     const VREALLOC: Self = Self(bindings::vrealloc_node_align);
 
     // INVARIANT: `kvrealloc_node_align` satisfies the type invariants.
@@ -248,7 +248,14 @@ unsafe impl Allocator for Vmalloc {
     ) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: If not `None`, `ptr` is guaranteed to point to valid memory, which was previously
         // allocated with this `Allocator`.
-        unsafe { ReallocFunc::VREALLOC.call(ptr, layout, old_layout, flags, nid) }
+        #[cfg(CONFIG_RUST_VMALLOC)]
+        {
+            return unsafe { crate::alloc::vmalloc::realloc(ptr, layout, old_layout, flags, nid) };
+        }
+        #[cfg(not(CONFIG_RUST_VMALLOC))]
+        unsafe {
+            ReallocFunc::VREALLOC.call(ptr, layout, old_layout, flags, nid)
+        }
     }
 }
 
