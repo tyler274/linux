@@ -3,9 +3,9 @@
 //! Page-allocator backend for the mimalloc-inspired slab.
 //!
 //! With `CONFIG_RUST_BUDDY`, folios come from the Rust buddy first and fall
-//! back to the C buddy (`alloc_pages_node` / `__free_pages`). GFP flags are
-//! passed through; callers must not hold IRQ-disabled locks across a blocking
-//! `alloc_pages` call.
+//! back to the C buddy (`alloc_pages_node` / `__free_pages`) if the pool
+//! misses. GFP flags are passed through; callers must not hold IRQ-disabled
+//! locks across a blocking `alloc_pages` call.
 
 use crate::{
     alloc::Flags,

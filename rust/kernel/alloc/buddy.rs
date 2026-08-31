@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Experimental Rust buddy over spans stolen from the C page allocator.
+//! Experimental Rust buddy that owns memblock spans (with C steal as fill-in).
 //!
-//! This is not a replacement for `mm/page_alloc.c`. The C buddy stays the
-//! system allocator. Spans are obtained with `alloc_pages` (`__GFP_COMP`) and
-//! then split/coalesced using off-`struct page` metadata so `PageBuddy` is
-//! never set. Allocations that miss the pool fall back to C.
-//!
-//! Enabled with `CONFIG_RUST_BUDDY`.
+//! With `CONFIG_RUST_BUDDY`, `alloc_pages` / `__free_pages` try this pool
+//! first (see `mm/page_alloc.c`). Spans are reserved from memblock before
+//! `memblock_free_all` so they never enter the C buddy. Any remaining slots
+//! are stolen with `alloc_pages` (`__GFP_COMP`). Split/coalesce uses
+//! off-`struct page` metadata so `PageBuddy` is never set. GFP_DMA, orders
+//! above [`MAX_ORDER`], and pool misses fall through to C.
 
 use crate::{
     alloc::{
@@ -34,13 +34,17 @@ use core::ptr;
 pub const MAX_ORDER: u32 = 9;
 /// Number of order buckets, `0..=MAX_ORDER`.
 const NR_ORDERS: usize = (MAX_ORDER as usize) + 1;
-/// Pages per stolen span.
+/// Pages per span.
 const SPAN_PAGES: usize = 1 << MAX_ORDER;
-/// Maximum number of spans stolen from C.
-const NR_SPANS: usize = 16;
+/// Maximum number of spans (128 * 2 MiB = 256 MiB).
+const NR_SPANS: usize = 128;
 const NONE: u16 = 0xFFFF;
 const STATE_NONE: u8 = 0xFF;
 const STATE_FREE: u8 = 0x80;
+/// Per-CPU order-0 cache depth.
+const PCP_BATCH: usize = 32;
+/// Compile-time cap; skip PCP if `raw_smp_processor_id` is above this.
+const MAX_CPUS: usize = 64;
 
 struct Span {
     base_pfn: u64,
@@ -179,7 +183,113 @@ unsafe impl Sync for BuddyCell {}
 
 static BUDDY: BuddyCell = BuddyCell(UnsafeCell::new(Buddy::new()));
 static READY: Atomic<i32> = Atomic::new(0);
+static STEALING: Atomic<i32> = Atomic::new(0);
 static N_SPANS: Atomic<i32> = Atomic::new(0);
+static N_MEMBLOCK: Atomic<i32> = Atomic::new(0);
+
+struct Pcp {
+    n: u16,
+    pages: [*mut bindings::page; PCP_BATCH],
+}
+
+impl Pcp {
+    const fn empty() -> Self {
+        Self {
+            n: 0,
+            pages: [ptr::null_mut(); PCP_BATCH],
+        }
+    }
+}
+
+struct PcpCell(UnsafeCell<[Pcp; MAX_CPUS]>);
+
+// SAFETY: Each slot is only mutated on its CPU with IRQs off.
+unsafe impl Sync for PcpCell {}
+
+static PCPS: PcpCell = PcpCell(UnsafeCell::new([const { Pcp::empty() }; MAX_CPUS]));
+
+fn current_cpu() -> usize {
+    // SAFETY: `raw_smp_processor_id` is always safe to read.
+    (unsafe { bindings::raw_smp_processor_id() }) as usize
+}
+
+fn pcp_this() -> Option<*mut Pcp> {
+    let cpu = current_cpu();
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    // SAFETY: `cpu` is in range; IRQs off on this CPU for mutation.
+    Some(unsafe { (*PCPS.0.get()).as_mut_ptr().add(cpu) })
+}
+
+fn freeze_block(page: *mut bindings::page, order: u32) {
+    let nr = 1usize << order;
+    for j in 0..nr {
+        // SAFETY: `page` is the start of `nr` pages we own.
+        unsafe { bindings::set_page_count(page.add(j), 0) };
+    }
+}
+
+fn pcp_pop() -> *mut bindings::page {
+    let _irq = IrqSave::save();
+    let Some(p) = pcp_this() else {
+        return ptr::null_mut();
+    };
+    // SAFETY: IRQs off; this CPU owns the slot.
+    let pcp = unsafe { &mut *p };
+    if pcp.n == 0 {
+        return ptr::null_mut();
+    }
+    pcp.n -= 1;
+    let page = pcp.pages[pcp.n as usize];
+    pcp.pages[pcp.n as usize] = ptr::null_mut();
+    page
+}
+
+fn pcp_push(page: *mut bindings::page) -> bool {
+    let _irq = IrqSave::save();
+    let Some(p) = pcp_this() else {
+        return false;
+    };
+    // SAFETY: IRQs off; this CPU owns the slot.
+    let pcp = unsafe { &mut *p };
+    if pcp.n as usize >= PCP_BATCH {
+        return false;
+    }
+    pcp.pages[pcp.n as usize] = page;
+    pcp.n += 1;
+    true
+}
+
+fn pcp_refill() {
+    let _irq = IrqSave::save();
+    let Some(p) = pcp_this() else {
+        return;
+    };
+    // SAFETY: IRQs off; this CPU owns the slot.
+    let pcp = unsafe { &mut *p };
+    if pcp.n as usize >= PCP_BATCH / 2 {
+        return;
+    }
+    let mut guard = LockGuard::acquire();
+    let b = guard.inner();
+    let n = N_SPANS.load(Relaxed) as usize;
+    while (pcp.n as usize) < PCP_BATCH / 2 {
+        let mut got = ptr::null_mut();
+        for i in 0..n {
+            if let Some(rel) = b.spans[i].alloc(0) {
+                got = b.spans[i].page(rel);
+                break;
+            }
+        }
+        if got.is_null() {
+            break;
+        }
+        freeze_block(got, 0);
+        pcp.pages[pcp.n as usize] = got;
+        pcp.n += 1;
+    }
+}
 
 fn buddy() -> *mut Buddy {
     BUDDY.0.get()
@@ -243,12 +353,7 @@ fn steal_span(gfp: Flags) -> *mut bindings::page {
     unsafe { bindings::alloc_pages_node(bindings::NUMA_NO_NODE, flags, MAX_ORDER) }
 }
 
-fn add_span(page: *mut bindings::page) -> bool {
-    // SAFETY: `page` is a compound folio of `MAX_ORDER` we own from C.
-    unsafe { bindings::destroy_compound_page(page) };
-    // SAFETY: `page` remains a valid `struct page` after destroying compound.
-    let pfn = unsafe { bindings::page_to_pfn(page) } as u64;
-
+fn add_span_at(pfn: u64) -> bool {
     let mut guard = LockGuard::acquire();
     let b = guard.inner();
     let n = N_SPANS.load(Relaxed) as usize;
@@ -264,6 +369,42 @@ fn add_span(page: *mut bindings::page) -> bool {
     true
 }
 
+fn add_span(page: *mut bindings::page) -> bool {
+    // SAFETY: `page` is a compound folio of `MAX_ORDER` we own from C.
+    unsafe { bindings::destroy_compound_page(page) };
+    // SAFETY: `page` remains a valid `struct page` after destroying compound.
+    let pfn = unsafe { bindings::page_to_pfn(page) } as u64;
+    add_span_at(pfn)
+}
+
+/// Import a memblock-reserved span. The C side has already cleared
+/// `PageReserved` and set refcounts to zero.
+///
+/// Returns 0 on success, `-1` if the table is full.
+#[no_mangle]
+pub unsafe extern "C" fn rust_buddy_add_span(pfn: crate::ffi::c_ulong) -> i32 {
+    if add_span_at(pfn as u64) {
+        N_MEMBLOCK.store(N_MEMBLOCK.load(Relaxed) + 1, Relaxed);
+        0
+    } else {
+        -1
+    }
+}
+
+fn announce() {
+    if N_SPANS.load(Relaxed) == 0 {
+        return;
+    }
+    pr_info!(
+        "rust-buddy: {} memblock + {} stolen order-{} spans ({} KiB), pcp {}\n",
+        N_MEMBLOCK.load(Relaxed),
+        N_SPANS.load(Relaxed) - N_MEMBLOCK.load(Relaxed),
+        MAX_ORDER,
+        (N_SPANS.load(Relaxed) as usize) * SPAN_PAGES * crate::page::PAGE_SIZE / 1024,
+        PCP_BATCH
+    );
+}
+
 fn return_span_to_c(page: *mut bindings::page) {
     // SAFETY: We still own this folio; restore compound before C free.
     unsafe {
@@ -274,12 +415,16 @@ fn return_span_to_c(page: *mut bindings::page) {
 
 /// Steal spans from the C buddy. Safe to call more than once.
 ///
-/// Does nothing if `gfp` cannot sleep (IRQ / `GFP_ATOMIC`).
+/// Does nothing if `gfp` cannot sleep (IRQ / `GFP_ATOMIC`). Sets [`STEALING`]
+/// so a nested `alloc_pages` from this CPU falls through to C.
 pub fn maybe_init(gfp: Flags) {
     if READY.load(Acquire) != 0 {
         return;
     }
     if !gfp_may_block(gfp) {
+        return;
+    }
+    if STEALING.cmpxchg(0, 1, Relaxed).is_err() {
         return;
     }
 
@@ -295,14 +440,8 @@ pub fn maybe_init(gfp: Flags) {
         }
     }
     READY.store(1, Release);
-    if N_SPANS.load(Relaxed) != 0 {
-        pr_info!(
-            "rust-buddy: {} order-{} spans ({} KiB)\n",
-            N_SPANS.load(Relaxed),
-            MAX_ORDER,
-            (N_SPANS.load(Relaxed) as usize) * SPAN_PAGES * crate::page::PAGE_SIZE / 1024
-        );
-    }
+    STEALING.store(0, Release);
+    announce();
 }
 
 /// Initialise the pool with a sleeping GFP. Called from `rust_mi_init`.
@@ -334,11 +473,20 @@ pub unsafe fn owns(page: *mut bindings::page) -> bool {
 
 /// Allocate `1 << order` contiguous pages from the pool, or null.
 ///
+/// The returned pages are frozen (`refcount == 0`) and not compound.
 /// Falls through (null) when the pool is empty or `order > MAX_ORDER`.
-pub fn alloc(order: u32, gfp: Flags) -> *mut bindings::page {
+fn alloc_block(order: u32, gfp: Flags) -> *mut bindings::page {
     maybe_init(gfp);
     if order > MAX_ORDER || N_SPANS.load(Acquire) == 0 {
         return ptr::null_mut();
+    }
+
+    if order == 0 {
+        let page = pcp_pop();
+        if !page.is_null() {
+            freeze_block(page, 0);
+            return page;
+        }
     }
 
     let mut guard = LockGuard::acquire();
@@ -348,14 +496,62 @@ pub fn alloc(order: u32, gfp: Flags) -> *mut bindings::page {
         if let Some(rel) = b.spans[i].alloc(order) {
             let page = b.spans[i].page(rel);
             drop(guard);
-            if order > 0 {
-                // SAFETY: `page` is the start of `1 << order` pages we own.
-                unsafe { bindings::prep_compound_page(page, order) };
+            freeze_block(page, order);
+            if order == 0 {
+                pcp_refill();
             }
             return page;
         }
     }
     ptr::null_mut()
+}
+
+/// Allocate a counted folio for slab / vmalloc, or null.
+///
+/// Falls through (null) when the pool is empty or `order > MAX_ORDER`.
+pub fn alloc(order: u32, gfp: Flags) -> *mut bindings::page {
+    let page = alloc_block(order, gfp);
+    if page.is_null() {
+        return page;
+    }
+    // SAFETY: Frozen page from [`alloc_block`]; slab wants refcount 1.
+    unsafe { bindings::set_page_count(page, 1) };
+    if order > 0 {
+        // SAFETY: `page` is the start of `1 << order` pages we own.
+        unsafe { bindings::prep_compound_page(page, order) };
+    }
+    page
+}
+
+/// C ABI: frozen pages for `mm/page_alloc.c`. Returns null to fall back to C.
+#[no_mangle]
+pub unsafe extern "C" fn rust_buddy_alloc_pages(
+    gfp: u32,
+    order: u32,
+    _nid: i32,
+) -> *mut bindings::page {
+    if STEALING.load(Acquire) != 0 {
+        return ptr::null_mut();
+    }
+    alloc_block(order, crate::alloc::Flags(gfp))
+}
+
+/// C ABI: true if `page` lies in a stolen span.
+#[no_mangle]
+pub unsafe extern "C" fn rust_buddy_owns_page(page: *const bindings::page) -> bool {
+    // SAFETY: Caller passes a live `struct page` or null.
+    unsafe { owns(page.cast_mut()) }
+}
+
+/// C ABI: return a frozen block to the pool.
+#[no_mangle]
+pub unsafe extern "C" fn rust_buddy_free_pages(page: *mut bindings::page, order: u32) {
+    if page.is_null() {
+        return;
+    }
+    // SAFETY: Frozen block from [`rust_buddy_alloc_pages`] or an equivalent
+    // counted alloc whose refcount already dropped to zero.
+    unsafe { free(page, order) };
 }
 
 /// C ABI used by `mm/rust_vmalloc.c`.
@@ -392,6 +588,8 @@ pub unsafe fn free(page: *mut bindings::page, order: u32) {
     if order > 0 {
         // SAFETY: Alloc path called `prep_compound_page` for `order > 0`.
         unsafe { bindings::destroy_compound_page(page) };
+    } else if pcp_push(page) {
+        return;
     }
     // SAFETY: `page` is a valid page in a stolen span.
     let pfn = unsafe { bindings::page_to_pfn(page) } as u64;

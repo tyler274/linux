@@ -15,6 +15,9 @@
 #include <linux/sched.h>
 #include <linux/mman.h>
 #include <linux/memblock.h>
+#include <linux/sizes.h>
+#include <linux/page_ref.h>
+#include <linux/pfn.h>
 #include <linux/page-isolation.h>
 #include <linux/padata.h>
 #include <linux/nmi.h>
@@ -38,6 +41,45 @@
 #include "sparse.h"
 #include "slab.h"
 #include "shuffle.h"
+
+#ifdef CONFIG_RUST_BUDDY
+#define RUST_BUDDY_MAX_ORDER	9
+#define RUST_BUDDY_SPAN_PAGES	(1UL << RUST_BUDDY_MAX_ORDER)
+#define RUST_BUDDY_NR_SPANS	128
+#define RUST_BUDDY_C_RESERVE	SZ_64M
+
+int rust_buddy_add_span(unsigned long pfn);
+
+static void __init rust_buddy_memblock_reserve(void)
+{
+	const phys_addr_t span = PAGE_SIZE << RUST_BUDDY_MAX_ORDER;
+	unsigned int n;
+
+	for (n = 0; n < RUST_BUDDY_NR_SPANS; n++) {
+		phys_addr_t avail = memblock_phys_mem_size() - memblock_reserved_size();
+		phys_addr_t pa;
+		struct page *page;
+		unsigned int i;
+
+		if (avail < RUST_BUDDY_C_RESERVE + span)
+			break;
+		pa = memblock_phys_alloc(span, span);
+		if (!pa)
+			break;
+		page = pfn_to_page(PHYS_PFN(pa));
+		for (i = 0; i < RUST_BUDDY_SPAN_PAGES; i++) {
+			__ClearPageReserved(page + i);
+			set_page_count(page + i, 0);
+		}
+		if (rust_buddy_add_span(PHYS_PFN(pa))) {
+			memblock_phys_free(pa, span);
+			break;
+		}
+	}
+}
+#else
+static inline void rust_buddy_memblock_reserve(void) {}
+#endif
 #include "vmalloc.h"
 
 #include <asm/setup.h>
@@ -2667,6 +2709,7 @@ void __init mm_core_init(void)
 	 */
 	kho_memory_init();
 
+	rust_buddy_memblock_reserve();
 	memblock_free_all();
 	mem_init();
 	kmem_cache_init();

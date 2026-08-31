@@ -61,6 +61,12 @@
 #include "shuffle.h"
 #include "page_reporting.h"
 
+#ifdef CONFIG_RUST_BUDDY
+struct page *rust_buddy_alloc_pages(gfp_t gfp, unsigned int order, int nid);
+bool rust_buddy_owns_page(const struct page *page);
+void rust_buddy_free_pages(struct page *page, unsigned int order);
+#endif
+
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -2954,6 +2960,14 @@ static void __free_frozen_pages(struct page *page, unsigned int order,
 	unsigned long pfn = page_to_pfn(page);
 	int migratetype;
 
+#ifdef CONFIG_RUST_BUDDY
+	if (rust_buddy_owns_page(page)) {
+		if (__free_pages_prepare(page, order, fpi_flags))
+			rust_buddy_free_pages(page, order);
+		return;
+	}
+#endif
+
 	if (!pcp_allowed_order(order)) {
 		__free_pages_ok(page, order, fpi_flags);
 		return;
@@ -3018,6 +3032,14 @@ void free_unref_folios(struct folio_batch *folios)
 		struct folio *folio = folios->folios[i];
 		unsigned long pfn = folio_pfn(folio);
 		unsigned int order = folio_order(folio);
+
+#ifdef CONFIG_RUST_BUDDY
+		if (rust_buddy_owns_page(&folio->page)) {
+			if (__free_pages_prepare(&folio->page, order, FPI_NONE))
+				rust_buddy_free_pages(&folio->page, order);
+			continue;
+		}
+#endif
 
 		if (!__free_pages_prepare(&folio->page, order, FPI_NONE))
 			continue;
@@ -5185,6 +5207,22 @@ unsigned long alloc_pages_bulk_noprof(gfp_t gfp, int preferred_nid,
 	if (unlikely(nr_pages - nr_populated == 0))
 		goto out;
 
+#ifdef CONFIG_RUST_BUDDY
+	if (!(gfp & (__GFP_DMA | __GFP_HIGHMEM))) {
+		while (nr_populated < nr_pages) {
+			page = rust_buddy_alloc_pages(gfp, 0, preferred_nid);
+			if (!page)
+				break;
+			prep_new_page(page, 0, gfp, ALLOC_DEFAULT);
+			set_page_refcounted(page);
+			page_array[nr_populated++] = page;
+			nr_account++;
+		}
+		if (nr_populated >= nr_pages)
+			goto out;
+	}
+#endif
+
 	/* Bulk allocator does not support memcg accounting. */
 	if (memcg_kmem_online() && (gfp & __GFP_ACCOUNT))
 		goto failed;
@@ -5317,7 +5355,18 @@ EXPORT_SYMBOL_GPL(alloc_pages_bulk_noprof);
 void free_pages_bulk(struct page **page_array, unsigned long nr_pages)
 {
 	while (nr_pages) {
-		unsigned long nr_contig = num_pages_contiguous(page_array, nr_pages);
+		unsigned long nr_contig;
+
+#ifdef CONFIG_RUST_BUDDY
+		if (rust_buddy_owns_page(*page_array)) {
+			if (__free_pages_prepare(*page_array, 0, FPI_NONE))
+				rust_buddy_free_pages(*page_array, 0);
+			nr_pages--;
+			page_array++;
+			continue;
+		}
+#endif
+		nr_contig = num_pages_contiguous(page_array, nr_pages);
 
 		__free_contig_range(page_to_pfn(*page_array), nr_contig);
 
@@ -5396,6 +5445,17 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
 
 	if (!alloc_order_allowed(gfp, order, alloc_flags))
 		return NULL;
+
+#ifdef CONFIG_RUST_BUDDY
+	if (!(gfp & (__GFP_DMA | __GFP_HIGHMEM))) {
+		page = rust_buddy_alloc_pages(gfp, order, preferred_nid);
+		if (page) {
+			prep_new_page(page, order, gfp, alloc_flags);
+			kmsan_alloc_page(page, order, gfp);
+			return page;
+		}
+	}
+#endif
 
 	if (alloc_flags & ALLOC_NOLOCK) {
 		/* Certain other flags could be supported later if needed. */

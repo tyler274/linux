@@ -181,14 +181,14 @@ config SLAB_MIMALLOC
 	  If unsure, say N.
 
 config RUST_BUDDY
-	bool "Rust buddy page allocator for slab (EXPERIMENTAL)"
+	bool "Rust buddy page allocator (EXPERIMENTAL, system front-end)"
 	depends on RUST && EXPERT
 	help
-	  Steal physically contiguous spans from the C page allocator and
-	  serve small-order allocations from a Rust split/coalesce buddy.
-	  The C buddy remains the system allocator; this only backs the
-	  Rust slab (MiKmalloc / CONFIG_SLAB_MIMALLOC), with a fallback
-	  to alloc_pages when the pool is empty.
+	  Reserve 2 MiB spans from memblock before the C buddy is filled,
+	  then serve alloc_pages (including bulk) from a Rust split/coalesce
+	  buddy with a per-CPU order-0 cache. C remains for GFP_DMA,
+	  high-order, and pool overflow. Zone watermarks and compaction
+	  stay in C.
 
 	  If unsure, say N.
 

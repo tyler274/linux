@@ -86,3 +86,8 @@ __rust_helper void rust_helper_destroy_compound_page(struct page *page)
 		set_page_count(page + i, 1);
 	}
 }
+
+__rust_helper void rust_helper_set_page_count(struct page *page, int v)
+{
+	set_page_count(page, v);
+}
