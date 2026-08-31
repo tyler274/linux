@@ -204,6 +204,16 @@ config RUST_VMALLOC
 
 	  If unsure, say N.
 
+config RUST_MMAP
+	bool "Rust mmap VA search (EXPERIMENTAL)"
+	depends on RUST && EXPERT && MMU
+	help
+	  Serve vm_unmapped_area from a Rust first-fit / top-down walk of
+	  existing VMAs. Maple-tree VMA storage, do_mmap, and page-fault
+	  handling stay in C.
+
+	  If unsure, say N.
+
 config KVFREE_RCU_BATCHED
 	def_bool y
 	depends on !SLUB_TINY && !TINY_RCU

@@ -4312,6 +4312,9 @@ struct vm_unmapped_area_info {
 };
 
 extern unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info);
+#ifdef CONFIG_RUST_MMAP
+unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
+#endif
 
 /* truncate.c */
 void truncate_inode_pages(struct address_space *mapping, loff_t lstart);

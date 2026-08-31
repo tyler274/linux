@@ -679,10 +679,14 @@ unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info)
 {
 	unsigned long addr;
 
+#ifdef CONFIG_RUST_MMAP
+	addr = rust_vm_unmapped_area(info);
+#else
 	if (info->flags & VM_UNMAPPED_AREA_TOPDOWN)
 		addr = unmapped_area_topdown(info);
 	else
 		addr = unmapped_area(info);
+#endif
 
 	trace_vm_unmapped_area(addr, info);
 	return addr;

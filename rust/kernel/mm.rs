@@ -21,6 +21,9 @@ use core::{ops::Deref, ptr::NonNull};
 pub mod virt;
 use virt::VmaRef;
 
+#[cfg(CONFIG_RUST_MMAP)]
+pub mod unmap;
+
 #[cfg(CONFIG_MMU)]
 pub use mmput_async::MmWithUserAsync;
 mod mmput_async;

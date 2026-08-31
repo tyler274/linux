@@ -48,3 +48,15 @@ __rust_helper void rust_helper_vma_end_read(struct vm_area_struct *vma)
 {
 	vma_end_read(vma);
 }
+
+#ifdef CONFIG_RUST_MMAP
+__rust_helper unsigned long rust_helper_vm_start_gap(const struct vm_area_struct *vma)
+{
+	return vm_start_gap(vma);
+}
+
+__rust_helper unsigned long rust_helper_vm_end_gap(const struct vm_area_struct *vma)
+{
+	return vm_end_gap(vma);
+}
+#endif
