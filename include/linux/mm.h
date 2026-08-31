@@ -4314,6 +4314,17 @@ struct vm_unmapped_area_info {
 extern unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info);
 #ifdef CONFIG_RUST_MMAP
 unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
+#define RUST_MUNMAP_DONE	0
+#define RUST_MUNMAP_ALIGN	1
+int rust_munmap_dispatch(struct vma_iterator *vmi, struct mm_struct *mm,
+			 unsigned long start, size_t len, struct list_head *uf,
+			 bool unlock, int *handled);
+int rust_munmap_classify(struct vma_iterator *vmi, struct mm_struct *mm,
+			 unsigned long start, size_t len, bool unlock, int *out,
+			 struct vm_area_struct **vma, unsigned long *end);
+int rust_munmap_align(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		      struct mm_struct *mm, unsigned long start,
+		      unsigned long end, struct list_head *uf, bool unlock);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0
@@ -4345,6 +4356,13 @@ unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
 #define RUST_HMF_DONE		0
 #define RUST_HMF_HUGETLB	1
 #define RUST_HMF_REGULAR	2
+#define RUST_SWAP_DONE		0
+#define RUST_SWAP_MIGRATION	1
+#define RUST_SWAP_DEV_EXCL	2
+#define RUST_SWAP_DEV_PRIV	3
+#define RUST_SWAP_MARKER	4
+#define RUST_SWAP_BAD		5
+#define RUST_SWAP_IN		6
 vm_fault_t rust_handle_pte_fault(struct vm_fault *vmf, int *handled);
 int rust_pte_classify(struct vm_fault *vmf, vm_fault_t *out);
 int rust_vma_is_anonymous(struct vm_fault *vmf);
@@ -4403,6 +4421,14 @@ vm_fault_t rust_hugetlb_fault(struct vm_area_struct *vma, unsigned long address,
 vm_fault_t rust_do_handle_mm_fault(struct vm_area_struct *vma,
 				   unsigned long address, unsigned int flags);
 void rust_hmf_exit(unsigned int flags, vm_fault_t *ret, int droppable);
+vm_fault_t rust_swap_dispatch(struct vm_fault *vmf, int *handled);
+int rust_swap_classify(struct vm_fault *vmf, vm_fault_t *out);
+vm_fault_t rust_swap_migration(struct vm_fault *vmf);
+vm_fault_t rust_swap_dev_excl(struct vm_fault *vmf);
+vm_fault_t rust_swap_dev_priv(struct vm_fault *vmf);
+vm_fault_t rust_swap_marker(struct vm_fault *vmf);
+vm_fault_t rust_swap_bad(struct vm_fault *vmf);
+vm_fault_t rust_swap_in(struct vm_fault *vmf);
 #endif
 
 /* truncate.c */

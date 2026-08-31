@@ -6,10 +6,11 @@
 //! (PUD/PMD/THP vs PTE), and `handle_pte_fault` are sequenced here:
 //! missing, swap, NUMA, uffd-rwp, write-protect, and access-flag update.
 //! Private anonymous read (zero-page) and write faults, `wp_page_copy`,
-//! write-protect reuse, and file read/COW/shared faults are also sequenced
+//! write-protect reuse, file read/COW/shared faults, and non-present PTE
+//! specials (migration, device, marker) vs swap-in are also sequenced
 //! here. Sanitize, memcg, LRU-gen, accounting, page-table walk, arch PTE
-//! encoding, rmap, user copy, and the filemap/swap/THP/hugetlb/uffd bodies
-//! stay in C.
+//! encoding, rmap, user copy, and the filemap/swap-cache/THP/hugetlb/uffd
+//! bodies stay in C.
 
 use crate::{
     bindings,
@@ -31,6 +32,7 @@ static N_REUSE: Atomic<u32> = Atomic::new(0);
 static N_FILE: Atomic<u32> = Atomic::new(0);
 static N_MMF: Atomic<u32> = Atomic::new(0);
 static N_HMF: Atomic<u32> = Atomic::new(0);
+static N_SWAP: Atomic<u32> = Atomic::new(0);
 
 /// Matches `RUST_PTE_*` in `include/linux/mm.h`.
 const PTE_DONE: i32 = 0;
@@ -95,12 +97,27 @@ const HMF_HUGETLB: i32 = 1;
 /// Regular VMA: `__handle_mm_fault`.
 const HMF_REGULAR: i32 = 2;
 
+/// Matches `RUST_SWAP_*` in `include/linux/mm.h`.
+const SWAP_DONE: i32 = 0;
+/// Migration wait; PTE already unmapped.
+const SWAP_MIGRATION: i32 = 1;
+/// Device-exclusive restore.
+const SWAP_DEV_EXCL: i32 = 2;
+/// Device-private migrate-to-RAM.
+const SWAP_DEV_PRIV: i32 = 3;
+/// PTE marker (uffd, poison, ...).
+const SWAP_MARKER: i32 = 4;
+/// Unrecognized non-present PTE.
+const SWAP_BAD: i32 = 5;
+/// Real swap entry; PTE still mapped.
+const SWAP_IN: i32 = 6;
+
 /// `VM_FAULT_FALLBACK` from [`enum vm_fault_reason`].
 const VM_FAULT_FALLBACK: u32 = 0x800;
 
 /// Log that Rust is serving handle_mm_fault, PTE dispatch, anonymous faults, and COW.
 pub fn announce() {
-    pr_info!("rust-fault: handle_mm_fault sequencer and anonymous/COW handler active\n");
+    pr_info!("rust-fault: handle_mm_fault sequencer, swap specials, and anonymous/COW handler active\n");
 }
 
 /// C ABI: sequence `handle_pte_fault` after C classifies the PTE.
@@ -156,6 +173,60 @@ pub unsafe extern "C" fn rust_handle_pte_fault(
         PTE_WP => unsafe { bindings::rust_do_wp_page(vmf) },
         _ => {
             pr_err!("rust-fault: unknown PTE kind {kind}\n");
+            0
+        }
+    }
+}
+
+/// C ABI: sequence `do_swap_page` after C classifies specials vs swap-in.
+///
+/// Sets `*handled` once classify has unmapped a non-swap PTE (or left
+/// a swap PTE mapped for `finish_swap_page`).
+///
+/// # Safety
+///
+/// `vmf` must be the live fault descriptor with `orig_pte` cached as
+/// for `do_swap_page`. mmap or VMA lock held. `handled` must be a
+/// valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_swap_dispatch(
+    vmf: *mut bindings::vm_fault,
+    handled: *mut crate::ffi::c_int,
+) -> u32 {
+    if vmf.is_null() || handled.is_null() {
+        return VM_FAULT_OOM;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out = 0u32;
+    // SAFETY: Same lock as `do_swap_page`; PTE mapped, not yet locked.
+    let kind = unsafe { bindings::rust_swap_classify(vmf, &mut out) };
+    // Classify may unmap a non-swap PTE. C must not re-classify.
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_SWAP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-fault: first swap-path fault sequenced\n");
+    }
+
+    match kind {
+        SWAP_DONE => out,
+        // SAFETY: Migration entry; PTE unmapped.
+        SWAP_MIGRATION => unsafe { bindings::rust_swap_migration(vmf) },
+        // SAFETY: Device-exclusive; PTE unmapped; page in `orig_pte`.
+        SWAP_DEV_EXCL => unsafe { bindings::rust_swap_dev_excl(vmf) },
+        // SAFETY: Device-private; PTE unmapped.
+        SWAP_DEV_PRIV => unsafe { bindings::rust_swap_dev_priv(vmf) },
+        // SAFETY: PTE marker; PTE unmapped.
+        SWAP_MARKER => unsafe { bindings::rust_swap_marker(vmf) },
+        // SAFETY: Unrecognized non-present PTE; PTE unmapped.
+        SWAP_BAD => unsafe { bindings::rust_swap_bad(vmf) },
+        // SAFETY: Swap entry; PTE still mapped for `finish_swap_page`.
+        SWAP_IN => unsafe { bindings::rust_swap_in(vmf) },
+        _ => {
+            pr_err!("rust-fault: unknown swap kind {kind}\n");
             0
         }
     }

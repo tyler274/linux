@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Userspace VA search used when `CONFIG_RUST_MMAP=y`.
+//! Userspace VA search and munmap dispatch when `CONFIG_RUST_MMAP=y`.
 //!
 //! Replaces the maple-tree walk in `unmapped_area()` / `unmapped_area_topdown()`
-//! with a first-fit (bottom-up or top-down) walk of existing VMAs. Maple-tree
+//! with a first-fit (bottom-up or top-down) walk of existing VMAs, and
+//! sequences `do_vmi_munmap` (range check vs maple-tree unmap). Maple-tree
 //! storage, `do_mmap`, and page-fault handling stay in C. The mmap lock is
 //! already held by the C caller.
 
 use crate::{
     bindings,
-    error::code::ENOMEM,
-    ffi::c_ulong,
+    error::code::{EINVAL, ENOMEM},
+    ffi::{c_int, c_ulong},
     mm::virt::VmaRef,
     prelude::*,
+    sync::atomic::{
+        Atomic,
+        Relaxed, //
+    },
 };
 use core::ptr;
 
@@ -21,6 +26,13 @@ const TOPDOWN: c_ulong = 1;
 
 /// Cap on VMA visits so a corrupt tree cannot livelock mmap.
 const MAX_ITERS: u32 = 1_000_000;
+
+/// Matches `RUST_MUNMAP_*` in `include/linux/mm.h`.
+const MUNMAP_DONE: i32 = 0;
+/// Overlapping VMA found; maple-tree unmap.
+const MUNMAP_ALIGN: i32 = 1;
+
+static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -207,9 +219,9 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
     None
 }
 
-/// Log that Rust is serving `vm_unmapped_area`.
+/// Log that Rust is serving `vm_unmapped_area` and munmap dispatch.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and munmap sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -243,4 +255,60 @@ pub unsafe extern "C" fn rust_vm_unmapped_area(
         unmapped_bottom(mm, &search)
     };
     found.map(|a| a as c_ulong).unwrap_or_else(enomem)
+}
+
+/// C ABI: sequence `do_vmi_munmap` after C checks the range.
+///
+/// Sets `*handled` once classify has walked the VMA iterator (or
+/// rejected the range). Maple-tree split/unmap stays in C.
+///
+/// # Safety
+///
+/// mmap write lock held as for `do_vmi_munmap`. `vmi` and `mm` must be
+/// live. `handled` must be a valid out-parameter. `uf` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn rust_munmap_dispatch(
+    vmi: *mut bindings::vma_iterator,
+    mm: *mut bindings::mm_struct,
+    start: c_ulong,
+    len: usize,
+    uf: *mut bindings::list_head,
+    unlock: bool,
+    handled: *mut c_int,
+) -> c_int {
+    if vmi.is_null() || mm.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    let mut vma = ptr::null_mut();
+    let mut end: c_ulong = 0;
+    // SAFETY: Same lock as `do_vmi_munmap`; iterator positioned at `start`.
+    let kind = unsafe {
+        bindings::rust_munmap_classify(
+            vmi, mm, start, len, unlock, &mut out, &mut vma, &mut end,
+        )
+    };
+    // Classify may advance `vmi` or drop the mmap lock on an empty range.
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MUNMAP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first munmap sequenced\n");
+    }
+
+    match kind {
+        MUNMAP_DONE => out,
+        // SAFETY: Overlapping VMA; mmap write lock still held.
+        MUNMAP_ALIGN => unsafe {
+            bindings::rust_munmap_align(vmi, vma, mm, start, end, uf, unlock)
+        },
+        _ => {
+            pr_err!("rust-mmap: unknown munmap kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
 }

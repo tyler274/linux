@@ -5132,7 +5132,106 @@ static void check_swap_exclusive(struct folio *folio, swp_entry_t entry,
  * When returning, the lock may have been released in the same cases
  * as done by filemap_fault().
  */
-vm_fault_t do_swap_page(struct vm_fault *vmf)
+#ifdef CONFIG_RUST_FAULT
+int rust_swap_classify(struct vm_fault *vmf, vm_fault_t *out)
+{
+	softleaf_t entry;
+
+	*out = 0;
+	entry = softleaf_from_pte(vmf->orig_pte);
+	if (unlikely(!softleaf_is_swap(entry))) {
+		if (!pte_unmap_same(vmf))
+			return RUST_SWAP_DONE;
+		if (softleaf_is_migration(entry))
+			return RUST_SWAP_MIGRATION;
+		if (softleaf_is_device_exclusive(entry))
+			return RUST_SWAP_DEV_EXCL;
+		if (softleaf_is_device_private(entry))
+			return RUST_SWAP_DEV_PRIV;
+		if (softleaf_is_hwpoison(entry)) {
+			*out = VM_FAULT_HWPOISON;
+			return RUST_SWAP_DONE;
+		}
+		if (softleaf_is_marker(entry))
+			return RUST_SWAP_MARKER;
+		return RUST_SWAP_BAD;
+	}
+	return RUST_SWAP_IN;
+}
+
+vm_fault_t rust_swap_migration(struct vm_fault *vmf)
+{
+	migration_entry_wait(vmf->vma->vm_mm, vmf->pmd, vmf->address);
+	return 0;
+}
+
+vm_fault_t rust_swap_dev_excl(struct vm_fault *vmf)
+{
+	softleaf_t entry = softleaf_from_pte(vmf->orig_pte);
+
+	vmf->page = softleaf_to_page(entry);
+	return remove_device_exclusive_entry(vmf);
+}
+
+vm_fault_t rust_swap_dev_priv(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	softleaf_t entry = softleaf_from_pte(vmf->orig_pte);
+	vm_fault_t ret = 0;
+
+	if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+		/*
+		 * migrate_to_ram is not yet ready to operate
+		 * under VMA lock.
+		 */
+		vma_end_read(vma);
+		return VM_FAULT_RETRY;
+	}
+
+	vmf->page = softleaf_to_page(entry);
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+			vmf->address, &vmf->ptl);
+	if (unlikely(!vmf->pte ||
+		     !pte_same(ptep_get(vmf->pte), vmf->orig_pte)))
+		goto unlock;
+
+	/*
+	 * Get a page reference while we know the page can't be
+	 * freed.
+	 */
+	if (trylock_page(vmf->page)) {
+		struct dev_pagemap *pgmap;
+
+		get_page(vmf->page);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		pgmap = page_pgmap(vmf->page);
+		ret = pgmap->ops->migrate_to_ram(vmf);
+		unlock_page(vmf->page);
+		put_page(vmf->page);
+		return ret;
+	}
+	pte_unmap(vmf->pte);
+	softleaf_entry_wait_on_locked(entry, vmf->ptl);
+	return 0;
+unlock:
+	if (vmf->pte)
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return ret;
+}
+
+vm_fault_t rust_swap_marker(struct vm_fault *vmf)
+{
+	return handle_pte_marker(vmf);
+}
+
+vm_fault_t rust_swap_bad(struct vm_fault *vmf)
+{
+	print_bad_pte(vmf->vma, vmf->address, vmf->orig_pte, NULL);
+	return VM_FAULT_SIGBUS;
+}
+#endif
+
+static vm_fault_t finish_swap_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *swapcache = NULL, *folio;
@@ -5538,6 +5637,26 @@ out_release:
 	if (si)
 		put_swap_device(si);
 	return ret;
+}
+
+#ifdef CONFIG_RUST_FAULT
+vm_fault_t rust_swap_in(struct vm_fault *vmf)
+{
+	return finish_swap_page(vmf);
+}
+#endif
+
+vm_fault_t do_swap_page(struct vm_fault *vmf)
+{
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	rust_ret = rust_swap_dispatch(vmf, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_swap_page(vmf);
 }
 
 static bool pte_range_none(pte_t *pte, int nr_pages)

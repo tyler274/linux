@@ -209,8 +209,9 @@ config RUST_MMAP
 	depends on RUST && EXPERT && MMU
 	help
 	  Serve vm_unmapped_area from a Rust first-fit / top-down walk of
-	  existing VMAs. Maple-tree VMA storage, do_mmap, and page-fault
-	  handling stay in C.
+	  existing VMAs, and sequence do_vmi_munmap (range check vs
+	  maple-tree unmap). Maple-tree VMA storage, do_mmap, and
+	  page-fault handling stay in C.
 
 	  If unsure, say N.
 
@@ -222,10 +223,11 @@ config RUST_FAULT
 	  PUD/PMD/THP vs PTE, missing, swap, NUMA, uffd-rwp,
 	  write-protect, access flags). Private anonymous read
 	  (zero-page) and write faults, copy-on-write, write-protect
-	  reuse, and file read/COW/shared faults are sequenced in
-	  Rust. Sanitize, memcg, LRU-gen, accounting, page-table
-	  walk, arch PTE encoding, rmap, and the filemap/swap/THP/
-	  hugetlb/userfaultfd bodies stay in C.
+	  reuse, file read/COW/shared faults, and non-present PTE
+	  specials (migration, device, marker) vs swap-in are
+	  sequenced in Rust. Sanitize, memcg, LRU-gen, accounting,
+	  page-table walk, arch PTE encoding, rmap, and the
+	  filemap/swap-cache/THP/hugetlb/userfaultfd bodies stay in C.
 
 	  If unsure, say N.
 

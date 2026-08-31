@@ -1707,12 +1707,64 @@ gather_failed:
  * Return: 0 on success and drops the lock if so directed, error and leaves the
  * lock held otherwise.
  */
+#ifdef CONFIG_RUST_MMAP
+int rust_munmap_classify(struct vma_iterator *vmi, struct mm_struct *mm,
+			 unsigned long start, size_t len, bool unlock, int *out,
+			 struct vm_area_struct **vma_out, unsigned long *end_out)
+{
+	unsigned long end;
+	struct vm_area_struct *vma;
+
+	*out = 0;
+	*vma_out = NULL;
+	*end_out = 0;
+
+	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start) {
+		*out = -EINVAL;
+		return RUST_MUNMAP_DONE;
+	}
+
+	end = start + PAGE_ALIGN(len);
+	if (end == start) {
+		*out = -EINVAL;
+		return RUST_MUNMAP_DONE;
+	}
+
+	vma = vma_find(vmi, end);
+	if (!vma) {
+		if (unlock)
+			mmap_write_unlock(mm);
+		return RUST_MUNMAP_DONE;
+	}
+
+	*vma_out = vma;
+	*end_out = end;
+	return RUST_MUNMAP_ALIGN;
+}
+
+int rust_munmap_align(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		      struct mm_struct *mm, unsigned long start,
+		      unsigned long end, struct list_head *uf, bool unlock)
+{
+	return do_vmi_align_munmap(vmi, vma, mm, start, end, uf, unlock);
+}
+#endif
+
 int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
 		  unsigned long start, size_t len, struct list_head *uf,
 		  bool unlock)
 {
 	unsigned long end;
 	struct vm_area_struct *vma;
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_munmap_dispatch(vmi, mm, start, len, uf, unlock,
+					&handled);
+	if (handled)
+		return rust_ret;
+#endif
 
 	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
 		return -EINVAL;
