@@ -24,6 +24,9 @@ use virt::VmaRef;
 #[cfg(CONFIG_RUST_MMAP)]
 pub mod unmap;
 
+#[cfg(CONFIG_RUST_FAULT)]
+pub mod fault;
+
 #[cfg(CONFIG_MMU)]
 pub use mmput_async::MmWithUserAsync;
 mod mmput_async;

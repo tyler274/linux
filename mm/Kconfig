@@ -214,6 +214,16 @@ config RUST_MMAP
 
 	  If unsure, say N.
 
+config RUST_FAULT
+	bool "Rust anonymous write-fault handler (EXPERIMENTAL)"
+	depends on RUST && EXPERT && MMU
+	help
+	  Serve private anonymous write faults from Rust. Page-table
+	  install, rmap, and the zero-page read path stay in C. File,
+	  swap, THP, and userfaultfd faults also stay in C.
+
+	  If unsure, say N.
+
 config KVFREE_RCU_BATCHED
 	def_bool y
 	depends on !SLUB_TINY && !TINY_RCU

@@ -111,6 +111,8 @@ pub unsafe extern "C" fn rust_mi_init() {
     crate::alloc::vmalloc::announce();
     #[cfg(CONFIG_RUST_MMAP)]
     crate::mm::unmap::announce();
+    #[cfg(CONFIG_RUST_FAULT)]
+    crate::mm::fault::announce();
 }
 
 /// Allocate `size` bytes (C `kmalloc` backend).

@@ -4315,6 +4315,13 @@ extern unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info);
 #ifdef CONFIG_RUST_MMAP
 unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
 #endif
+#ifdef CONFIG_RUST_FAULT
+vm_fault_t rust_do_anonymous_page(struct vm_fault *vmf, int *handled);
+int rust_anon_write_prepare(struct vm_fault *vmf, vm_fault_t *out);
+struct folio *rust_anon_alloc_folio(struct vm_fault *vmf);
+void rust_anon_folio_uptodate(struct folio *folio);
+vm_fault_t rust_anon_install_folio(struct vm_fault *vmf, struct folio *folio);
+#endif
 
 /* truncate.c */
 void truncate_inode_pages(struct address_space *mapping, loff_t lstart);

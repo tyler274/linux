@@ -5418,6 +5418,62 @@ static void map_anon_folio_pte_pf(struct folio *folio, pte_t *pte,
 	count_mthp_stat(order, MTHP_STAT_ANON_FAULT_ALLOC);
 }
 
+#ifdef CONFIG_RUST_FAULT
+int rust_anon_write_prepare(struct vm_fault *vmf, vm_fault_t *out)
+{
+	*out = 0;
+	if (pte_alloc(vmf->vma->vm_mm, vmf->pmd)) {
+		*out = VM_FAULT_OOM;
+		return 1;
+	}
+	*out = vmf_anon_prepare(vmf);
+	return *out != 0;
+}
+
+struct folio *rust_anon_alloc_folio(struct vm_fault *vmf)
+{
+	return folio_prealloc(vmf->vma->vm_mm, vmf->vma, vmf->address, true);
+}
+
+void rust_anon_folio_uptodate(struct folio *folio)
+{
+	__folio_mark_uptodate(folio);
+}
+
+vm_fault_t rust_anon_install_folio(struct vm_fault *vmf, struct folio *folio)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long addr = vmf->address;
+	vm_fault_t ret = 0;
+
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+	if (!vmf->pte)
+		goto release;
+	if (vmf_pte_changed(vmf)) {
+		update_mmu_tlb(vma, addr, vmf->pte);
+		goto release;
+	}
+	ret = check_stable_address_space(vma->vm_mm);
+	if (ret)
+		goto release;
+	if (userfaultfd_missing(vma)) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		folio_put(folio);
+		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
+	map_anon_folio_pte_pf(folio, vmf->pte, vma, addr,
+			      vmf_orig_pte_uffd_wp(vmf));
+	if (vmf->pte)
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return ret;
+release:
+	folio_put(folio);
+	if (vmf->pte)
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return ret;
+}
+#endif
+
 /*
  * We enter with either the VMA lock or the mmap_lock held (see
  * FAULT_FLAG_VMA_LOCK), and pte unmapped and unlocked.
@@ -5436,6 +5492,16 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
 		return VM_FAULT_SIGBUS;
+
+#ifdef CONFIG_RUST_FAULT
+	if ((vmf->flags & FAULT_FLAG_WRITE) && !userfaultfd_armed(vma)) {
+		int handled = 0;
+
+		ret = rust_do_anonymous_page(vmf, &handled);
+		if (handled)
+			return ret;
+	}
+#endif
 
 	/*
 	 * Use pte_alloc() instead of pte_alloc_map(), so that OOM can
