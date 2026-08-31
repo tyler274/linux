@@ -4342,6 +4342,9 @@ unsigned long rust_vm_unmapped_area(struct vm_unmapped_area_info *info);
 #define RUST_MMF_NUMA		8
 #define RUST_MMF_WP_HUGE_PMD	9
 #define RUST_MMF_PTE		10
+#define RUST_HMF_DONE		0
+#define RUST_HMF_HUGETLB	1
+#define RUST_HMF_REGULAR	2
 vm_fault_t rust_handle_pte_fault(struct vm_fault *vmf, int *handled);
 int rust_pte_classify(struct vm_fault *vmf, vm_fault_t *out);
 int rust_vma_is_anonymous(struct vm_fault *vmf);
@@ -4391,6 +4394,15 @@ vm_fault_t rust_do_huge_pmd_device_private(struct vm_fault *vmf);
 vm_fault_t rust_do_huge_pmd_uffd_rwp(struct vm_fault *vmf);
 vm_fault_t rust_do_huge_pmd_numa_page(struct vm_fault *vmf);
 vm_fault_t rust_finish_pte_fault(struct vm_fault *vmf);
+vm_fault_t rust_mm_fault(struct vm_area_struct *vma, unsigned long address,
+			 unsigned int *flags, int *handled);
+int rust_hmf_prepare(struct vm_area_struct *vma, unsigned int *flags,
+		     vm_fault_t *out, int *droppable);
+vm_fault_t rust_hugetlb_fault(struct vm_area_struct *vma, unsigned long address,
+			      unsigned int flags);
+vm_fault_t rust_do_handle_mm_fault(struct vm_area_struct *vma,
+				   unsigned long address, unsigned int flags);
+void rust_hmf_exit(unsigned int flags, vm_fault_t *ret, int droppable);
 #endif
 
 /* truncate.c */

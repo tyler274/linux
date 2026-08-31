@@ -7562,6 +7562,80 @@ static vm_fault_t sanitize_fault_flags(struct vm_area_struct *vma,
 	return 0;
 }
 
+#ifdef CONFIG_RUST_FAULT
+int rust_hmf_prepare(struct vm_area_struct *vma, unsigned int *flags,
+		     vm_fault_t *out, int *droppable)
+{
+	*out = 0;
+	*droppable = 0;
+
+	__set_current_state(TASK_RUNNING);
+
+	*out = sanitize_fault_flags(vma, flags);
+	if (*out)
+		return RUST_HMF_DONE;
+
+	if (!arch_vma_access_permitted(vma, *flags & FAULT_FLAG_WRITE,
+					    *flags & FAULT_FLAG_INSTRUCTION,
+					    *flags & FAULT_FLAG_REMOTE)) {
+		*out = VM_FAULT_SIGSEGV;
+		return RUST_HMF_DONE;
+	}
+
+	*droppable = !!(vma->vm_flags & VM_DROPPABLE);
+
+	/*
+	 * Enable the memcg OOM handling for faults triggered in user
+	 * space.  Kernel faults are handled more gracefully.
+	 */
+	if (*flags & FAULT_FLAG_USER)
+		mem_cgroup_enter_user_fault();
+
+	lru_gen_enter_fault(vma);
+
+	if (unlikely(is_vm_hugetlb_page(vma)))
+		return RUST_HMF_HUGETLB;
+	return RUST_HMF_REGULAR;
+}
+
+vm_fault_t rust_hugetlb_fault(struct vm_area_struct *vma, unsigned long address,
+			      unsigned int flags)
+{
+	return hugetlb_fault(vma->vm_mm, vma, address, flags);
+}
+
+vm_fault_t rust_do_handle_mm_fault(struct vm_area_struct *vma,
+				   unsigned long address, unsigned int flags)
+{
+	return __handle_mm_fault(vma, address, flags);
+}
+
+void rust_hmf_exit(unsigned int flags, vm_fault_t *ret, int droppable)
+{
+	/*
+	 * Warning: It is no longer safe to dereference vma after the
+	 * handler: mmap_lock might have been dropped.
+	 */
+	lru_gen_exit_fault();
+
+	/* If the mapping is droppable, then errors due to OOM aren't fatal. */
+	if (droppable)
+		*ret &= ~VM_FAULT_OOM;
+
+	if (flags & FAULT_FLAG_USER) {
+		mem_cgroup_exit_user_fault();
+		/*
+		 * The task may have entered a memcg OOM situation but
+		 * if the allocation error was handled gracefully (no
+		 * VM_FAULT_OOM), there is no need to kill anything.
+		 * Just clean up the OOM state peacefully.
+		 */
+		if (task_in_memcg_oom(current) && !(*ret & VM_FAULT_OOM))
+			mem_cgroup_oom_synchronize(false);
+	}
+}
+#endif
+
 /*
  * By the time we get here, we already hold either the VMA lock or the
  * mmap_lock (see FAULT_FLAG_VMA_LOCK).
@@ -7576,6 +7650,16 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	struct mm_struct *mm = vma->vm_mm;
 	vm_fault_t ret;
 	bool is_droppable;
+#ifdef CONFIG_RUST_FAULT
+	int handled = 0;
+	vm_fault_t rust_ret;
+
+	rust_ret = rust_mm_fault(vma, address, &flags, &handled);
+	if (handled) {
+		mm_account_fault(mm, regs, address, flags, rust_ret);
+		return rust_ret;
+	}
+#endif
 
 	__set_current_state(TASK_RUNNING);
 

@@ -2,12 +2,14 @@
 
 //! PTE and mm-fault dispatch when `CONFIG_RUST_FAULT=y`.
 //!
-//! `__handle_mm_fault` (PUD/PMD/THP vs PTE) and `handle_pte_fault` are
-//! sequenced here: missing, swap, NUMA, uffd-rwp, write-protect, and
-//! access-flag update. Private anonymous read (zero-page) and write
-//! faults, `wp_page_copy`, write-protect reuse, and file read/COW/shared
-//! faults are also sequenced here. Page-table walk, arch PTE encoding,
-//! rmap, user copy, and the filemap/swap/THP/uffd bodies stay in C.
+//! `handle_mm_fault` (hugetlb vs regular), `__handle_mm_fault`
+//! (PUD/PMD/THP vs PTE), and `handle_pte_fault` are sequenced here:
+//! missing, swap, NUMA, uffd-rwp, write-protect, and access-flag update.
+//! Private anonymous read (zero-page) and write faults, `wp_page_copy`,
+//! write-protect reuse, and file read/COW/shared faults are also sequenced
+//! here. Sanitize, memcg, LRU-gen, accounting, page-table walk, arch PTE
+//! encoding, rmap, user copy, and the filemap/swap/THP/hugetlb/uffd bodies
+//! stay in C.
 
 use crate::{
     bindings,
@@ -28,6 +30,7 @@ static N_COW: Atomic<u32> = Atomic::new(0);
 static N_REUSE: Atomic<u32> = Atomic::new(0);
 static N_FILE: Atomic<u32> = Atomic::new(0);
 static N_MMF: Atomic<u32> = Atomic::new(0);
+static N_HMF: Atomic<u32> = Atomic::new(0);
 
 /// Matches `RUST_PTE_*` in `include/linux/mm.h`.
 const PTE_DONE: i32 = 0;
@@ -85,12 +88,19 @@ const MMF_WP_HUGE_PMD: i32 = 9;
 /// Fall back to `handle_pte_fault`.
 const MMF_PTE: i32 = 10;
 
+/// Matches `RUST_HMF_*` in `include/linux/mm.h`.
+const HMF_DONE: i32 = 0;
+/// Hugetlb VMA: `hugetlb_fault`.
+const HMF_HUGETLB: i32 = 1;
+/// Regular VMA: `__handle_mm_fault`.
+const HMF_REGULAR: i32 = 2;
+
 /// `VM_FAULT_FALLBACK` from [`enum vm_fault_reason`].
 const VM_FAULT_FALLBACK: u32 = 0x800;
 
-/// Log that Rust is serving mm-fault, PTE dispatch, anonymous faults, and COW.
+/// Log that Rust is serving handle_mm_fault, PTE dispatch, anonymous faults, and COW.
 pub fn announce() {
-    pr_info!("rust-fault: mm-fault/PTE sequencer and anonymous/COW handler active\n");
+    pr_info!("rust-fault: handle_mm_fault sequencer and anonymous/COW handler active\n");
 }
 
 /// C ABI: sequence `handle_pte_fault` after C classifies the PTE.
@@ -360,6 +370,62 @@ pub unsafe extern "C" fn rust_handle_mm_fault(
             }
         };
     }
+}
+
+/// C ABI: sequence `handle_mm_fault` after C sanitizes flags.
+///
+/// Sets `*handled` once prepare has run. C still accounts the fault
+/// (`mm_account_fault` needs `pt_regs`).
+///
+/// # Safety
+///
+/// mmap or VMA lock held as for `handle_mm_fault`. `vma` and `flags`
+/// must be live. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mm_fault(
+    vma: *mut bindings::vm_area_struct,
+    address: crate::ffi::c_ulong,
+    flags: *mut crate::ffi::c_uint,
+    handled: *mut crate::ffi::c_int,
+) -> u32 {
+    if vma.is_null() || flags.is_null() || handled.is_null() {
+        return VM_FAULT_OOM;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out = 0u32;
+    let mut droppable = 0;
+    // SAFETY: Same lock as `handle_mm_fault`; may enter memcg/LRU-gen.
+    let kind = unsafe { bindings::rust_hmf_prepare(vma, flags, &mut out, &mut droppable) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_HMF.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-fault: first handle_mm_fault sequenced\n");
+    }
+
+    if kind == HMF_DONE {
+        return out;
+    }
+
+    // SAFETY: `flags` is the live in/out parameter from C.
+    let flags_val = unsafe { *flags };
+    let ret = match kind {
+        // SAFETY: Hugetlb VMA; mmap/VMA lock held.
+        HMF_HUGETLB => unsafe { bindings::rust_hugetlb_fault(vma, address, flags_val) },
+        // SAFETY: Regular VMA; mmap/VMA lock held.
+        HMF_REGULAR => unsafe { bindings::rust_do_handle_mm_fault(vma, address, flags_val) },
+        _ => {
+            pr_err!("rust-fault: unknown handle_mm_fault kind {kind}\n");
+            0
+        }
+    };
+    let mut ret = ret;
+    // SAFETY: Handler finished; vma may no longer be dereferenced.
+    unsafe { bindings::rust_hmf_exit(flags_val, &mut ret, droppable) };
+    ret
 }
 
 /// C ABI: try to finish a private anonymous fault (zero-page or write).

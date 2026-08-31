@@ -218,13 +218,14 @@ config RUST_FAULT
 	bool "Rust page-fault sequencer (EXPERIMENTAL)"
 	depends on RUST && EXPERT && MMU
 	help
-	  Serve __handle_mm_fault and PTE fault dispatch from Rust
-	  (PUD/PMD/THP vs PTE, missing, swap, NUMA, uffd-rwp,
+	  Serve handle_mm_fault from Rust (hugetlb vs regular walk,
+	  PUD/PMD/THP vs PTE, missing, swap, NUMA, uffd-rwp,
 	  write-protect, access flags). Private anonymous read
 	  (zero-page) and write faults, copy-on-write, write-protect
 	  reuse, and file read/COW/shared faults are sequenced in
-	  Rust. Page-table walk, arch PTE encoding, rmap, and the
-	  filemap/swap/THP/userfaultfd bodies stay in C.
+	  Rust. Sanitize, memcg, LRU-gen, accounting, page-table
+	  walk, arch PTE encoding, rmap, and the filemap/swap/THP/
+	  hugetlb/userfaultfd bodies stay in C.
 
 	  If unsure, say N.
 
