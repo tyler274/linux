@@ -4395,6 +4395,39 @@ int rust_madvise_prepare(unsigned long start, size_t len_in, int behavior,
 			 int *out);
 int rust_madvise_apply(struct mm_struct *mm, unsigned long start,
 		       size_t len_in, int behavior);
+struct mmap_state;
+#define RUST_MMAPREG_DONE	0
+#define RUST_MMAPREG_INSTALL	1
+#define RUST_MMAPREG_CONT	2
+#define RUST_MMAPREG_NEW	3
+#define RUST_MMAPREG_COMPLETE	4
+unsigned long rust_mmap_region_dispatch(struct file *file, unsigned long addr,
+					unsigned long len, vma_flags_t *vma_flags,
+					unsigned long pgoff, struct list_head *uf,
+					int *handled);
+int rust_mmapreg_check(struct file *file, vma_flags_t *vma_flags, int *writable,
+		       unsigned long *out);
+unsigned long rust_mmapreg_install(struct file *file, unsigned long addr,
+				   unsigned long len, vma_flags_t *vma_flags,
+				   unsigned long pgoff, struct list_head *uf);
+unsigned long rust_mmapreg_exit(struct file *file, int writable,
+				unsigned long ret);
+unsigned long rust_mmapreg_inner_dispatch(struct mmap_state *map,
+					  struct vm_area_desc *desc,
+					  struct list_head *uf,
+					  int have_mmap_prepare, int *handled);
+int rust_mmapreg_setup(struct mmap_state *map, struct vm_area_desc *desc,
+		       struct list_head *uf, int have_mmap_prepare,
+		       unsigned long *out);
+int rust_mmapreg_merge(struct mmap_state *map, struct vm_area_struct **vma);
+int rust_mmapreg_new(struct mmap_state *map, struct vm_area_desc *desc,
+		     struct vm_area_struct **vma, unsigned long *out);
+unsigned long rust_mmapreg_complete(struct mmap_state *map,
+				    struct vm_area_struct *vma,
+				    struct vm_area_desc *desc,
+				    int have_mmap_prepare, int allocated_new);
+void rust_mmapreg_abort(struct mmap_state *map);
+void rust_mmapreg_unacct_abort(struct mmap_state *map);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

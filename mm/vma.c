@@ -2887,13 +2887,174 @@ static bool can_set_ksm_flags_early(struct mmap_state *map)
 	return false;
 }
 
+#define MMAPREG_DONE		0
+#define MMAPREG_INSTALL		1
+#define MMAPREG_CONT		2
+#define MMAPREG_NEW		3
+#define MMAPREG_COMPLETE	4
+
+static int mmapreg_setup(struct mmap_state *map, struct vm_area_desc *desc,
+			 struct list_head *uf, int have_mmap_prepare,
+			 unsigned long *out)
+{
+	int error;
+
+	*out = 0;
+	error = __mmap_setup(map, desc, uf);
+	if (!error && have_mmap_prepare)
+		error = call_mmap_prepare(map, desc);
+	if (error) {
+		*out = error;
+		return MMAPREG_DONE;
+	}
+	if (map->check_ksm_early)
+		update_ksm_flags(map);
+	return MMAPREG_CONT;
+}
+
+static int mmapreg_merge(struct mmap_state *map, struct vm_area_struct **vma)
+{
+	*vma = NULL;
+	if (map->prev || map->next) {
+		VMG_MMAP_STATE(vmg, map, /* vma = */ NULL);
+
+		*vma = vma_merge_new_range(&vmg);
+	}
+	if (*vma)
+		return MMAPREG_COMPLETE;
+	return MMAPREG_NEW;
+}
+
+static int mmapreg_new(struct mmap_state *map, struct vm_area_desc *desc,
+		       struct vm_area_struct **vma, unsigned long *out)
+{
+	int error;
+
+	*out = 0;
+	error = __mmap_new_vma(map, vma, &desc->action);
+	if (error) {
+		*out = error;
+		return MMAPREG_DONE;
+	}
+	return MMAPREG_COMPLETE;
+}
+
+static unsigned long mmapreg_complete(struct mmap_state *map,
+				      struct vm_area_struct *vma,
+				      struct vm_area_desc *desc,
+				      int have_mmap_prepare, int allocated_new)
+{
+	int error;
+
+	if (have_mmap_prepare)
+		set_vma_user_defined_fields(vma, map);
+
+	__mmap_complete(map, vma);
+
+	if (have_mmap_prepare && allocated_new) {
+		error = mmap_action_complete(vma, &desc->action,
+					     /*is_compat=*/false);
+		if (error)
+			return error;
+	}
+	return map->addr;
+}
+
+static void mmapreg_abort(struct mmap_state *map)
+{
+	/*
+	 * This indicates that .mmap_prepare has set a new file, differing from
+	 * desc->vm_file. But since we're aborting the operation, only the
+	 * original file will be cleaned up. Ensure we clean up both.
+	 */
+	if (map->file_doesnt_need_get)
+		fput(map->file);
+	vms_abort_munmap_vmas(&map->vms, &map->mas_detach);
+}
+
+static void mmapreg_unacct_abort(struct mmap_state *map)
+{
+	if (map->charged)
+		vm_unacct_memory(map->charged);
+	mmapreg_abort(map);
+}
+
+static unsigned long finish_mmap_install(struct mmap_state *map,
+					 struct vm_area_desc *desc,
+					 struct list_head *uf,
+					 int have_mmap_prepare)
+{
+	unsigned long out = 0;
+	struct vm_area_struct *vma = NULL;
+	int kind;
+	int allocated = 0;
+
+	kind = mmapreg_setup(map, desc, uf, have_mmap_prepare, &out);
+	if (kind == MMAPREG_DONE) {
+		mmapreg_abort(map);
+		return out;
+	}
+	kind = mmapreg_merge(map, &vma);
+	if (kind == MMAPREG_NEW) {
+		kind = mmapreg_new(map, desc, &vma, &out);
+		if (kind == MMAPREG_DONE) {
+			mmapreg_unacct_abort(map);
+			return out;
+		}
+		allocated = 1;
+	}
+	return mmapreg_complete(map, vma, desc, have_mmap_prepare, allocated);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mmapreg_setup(struct mmap_state *map, struct vm_area_desc *desc,
+		       struct list_head *uf, int have_mmap_prepare,
+		       unsigned long *out)
+{
+	return mmapreg_setup(map, desc, uf, have_mmap_prepare, out);
+}
+
+int rust_mmapreg_merge(struct mmap_state *map, struct vm_area_struct **vma)
+{
+	return mmapreg_merge(map, vma);
+}
+
+int rust_mmapreg_new(struct mmap_state *map, struct vm_area_desc *desc,
+		     struct vm_area_struct **vma, unsigned long *out)
+{
+	return mmapreg_new(map, desc, vma, out);
+}
+
+unsigned long rust_mmapreg_complete(struct mmap_state *map,
+				    struct vm_area_struct *vma,
+				    struct vm_area_desc *desc,
+				    int have_mmap_prepare, int allocated_new)
+{
+	return mmapreg_complete(map, vma, desc, have_mmap_prepare,
+				allocated_new);
+}
+
+void rust_mmapreg_abort(struct mmap_state *map)
+{
+	mmapreg_abort(map);
+}
+
+void rust_mmapreg_unacct_abort(struct mmap_state *map)
+{
+	mmapreg_unacct_abort(map);
+}
+#endif
+
 static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		unsigned long len, vma_flags_t vma_flags,
 		unsigned long pgoff, struct list_head *uf)
 {
 	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma = NULL;
-	bool have_mmap_prepare = file && file->f_op->mmap_prepare;
+	int have_mmap_prepare;
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	unsigned long rust_ret;
+#endif
 	VMA_ITERATOR(vmi, mm, addr);
 	const pgoff_t anon_pgoff = addr >> PAGE_SHIFT;
 	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, anon_pgoff, vma_flags, file);
@@ -2905,63 +3066,17 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		},
 		.vm_ops = &vma_dummy_vm_ops,
 	};
-	bool allocated_new = false;
-	int error;
 
+	have_mmap_prepare = file && file->f_op->mmap_prepare ? 1 : 0;
 	map.check_ksm_early = can_set_ksm_flags_early(&map);
 
-	error = __mmap_setup(&map, &desc, uf);
-	if (!error && have_mmap_prepare)
-		error = call_mmap_prepare(&map, &desc);
-	if (error)
-		goto abort_munmap;
-
-	if (map.check_ksm_early)
-		update_ksm_flags(&map);
-
-	/* Attempt to merge with adjacent VMAs... */
-	if (map.prev || map.next) {
-		VMG_MMAP_STATE(vmg, &map, /* vma = */ NULL);
-
-		vma = vma_merge_new_range(&vmg);
-	}
-
-	/* ...but if we can't, allocate a new VMA. */
-	if (!vma) {
-		error = __mmap_new_vma(&map, &vma, &desc.action);
-		if (error)
-			goto unacct_error;
-		allocated_new = true;
-	}
-
-	if (have_mmap_prepare)
-		set_vma_user_defined_fields(vma, &map);
-
-	__mmap_complete(&map, vma);
-
-	if (have_mmap_prepare && allocated_new) {
-		error = mmap_action_complete(vma, &desc.action,
-					     /*is_compat=*/false);
-		if (error)
-			return error;
-	}
-
-	return addr;
-
-	/* Accounting was done by __mmap_setup(). */
-unacct_error:
-	if (map.charged)
-		vm_unacct_memory(map.charged);
-abort_munmap:
-	/*
-	 * This indicates that .mmap_prepare has set a new file, differing from
-	 * desc->vm_file. But since we're aborting the operation, only the
-	 * original file will be cleaned up. Ensure we clean up both.
-	 */
-	if (map.file_doesnt_need_get)
-		fput(map.file);
-	vms_abort_munmap_vmas(&map.vms, &map.mas_detach);
-	return error;
+#ifdef CONFIG_RUST_MMAP
+	rust_ret = rust_mmapreg_inner_dispatch(&map, &desc, uf,
+					       have_mmap_prepare, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mmap_install(&map, &desc, uf, have_mmap_prepare);
 }
 
 /**
@@ -2987,40 +3102,100 @@ abort_munmap:
  * Returns: Either an error, or the address at which the requested mapping has
  * been performed.
  */
-unsigned long mmap_region(struct file *file, unsigned long addr,
-			  unsigned long len, vma_flags_t vma_flags,
-			  unsigned long pgoff, struct list_head *uf)
+static int mmap_region_check(struct file *file, vma_flags_t *vma_flags,
+			     int *writable, unsigned long *out)
 {
-	unsigned long ret;
-	bool writable_file_mapping = false;
+	int error;
 
+	*out = 0;
+	*writable = 0;
 	mmap_assert_write_locked(current->mm);
 
 	/* Check to see if MDWE is applicable. */
-	if (map_deny_write_exec(&vma_flags, &vma_flags))
-		return -EACCES;
-
-	/* Allow architectures to sanity-check the vm_flags. */
-	if (!arch_validate_flags(vma_flags_to_legacy(vma_flags)))
-		return -EINVAL;
-
-	/* Map writable and ensure this isn't a sealed memfd. */
-	if (file && is_shared_maywrite(&vma_flags)) {
-		int error = mapping_map_writable(file->f_mapping);
-
-		if (error)
-			return error;
-		writable_file_mapping = true;
+	if (map_deny_write_exec(vma_flags, vma_flags)) {
+		*out = -EACCES;
+		return MMAPREG_DONE;
 	}
 
-	ret = __mmap_region(file, addr, len, vma_flags, pgoff, uf);
+	/* Allow architectures to sanity-check the vm_flags. */
+	if (!arch_validate_flags(vma_flags_to_legacy(*vma_flags))) {
+		*out = -EINVAL;
+		return MMAPREG_DONE;
+	}
 
+	/* Map writable and ensure this isn't a sealed memfd. */
+	if (file && is_shared_maywrite(vma_flags)) {
+		error = mapping_map_writable(file->f_mapping);
+		if (error) {
+			*out = error;
+			return MMAPREG_DONE;
+		}
+		*writable = 1;
+	}
+	return MMAPREG_INSTALL;
+}
+
+static unsigned long mmap_region_exit(struct file *file, int writable,
+				      unsigned long ret)
+{
 	/* Clear our write mapping regardless of error. */
-	if (writable_file_mapping)
+	if (writable)
 		mapping_unmap_writable(file->f_mapping);
 
 	validate_mm(current->mm);
 	return ret;
+}
+
+static unsigned long finish_mmap_region(struct file *file, unsigned long addr,
+					unsigned long len, vma_flags_t vma_flags,
+					unsigned long pgoff, struct list_head *uf)
+{
+	unsigned long out = 0;
+	int writable = 0;
+	int kind;
+
+	kind = mmap_region_check(file, &vma_flags, &writable, &out);
+	if (kind == MMAPREG_DONE)
+		return out;
+	out = __mmap_region(file, addr, len, vma_flags, pgoff, uf);
+	return mmap_region_exit(file, writable, out);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mmapreg_check(struct file *file, vma_flags_t *vma_flags, int *writable,
+		       unsigned long *out)
+{
+	return mmap_region_check(file, vma_flags, writable, out);
+}
+
+unsigned long rust_mmapreg_install(struct file *file, unsigned long addr,
+				   unsigned long len, vma_flags_t *vma_flags,
+				   unsigned long pgoff, struct list_head *uf)
+{
+	return __mmap_region(file, addr, len, *vma_flags, pgoff, uf);
+}
+
+unsigned long rust_mmapreg_exit(struct file *file, int writable,
+				unsigned long ret)
+{
+	return mmap_region_exit(file, writable, ret);
+}
+#endif
+
+unsigned long mmap_region(struct file *file, unsigned long addr,
+			  unsigned long len, vma_flags_t vma_flags,
+			  unsigned long pgoff, struct list_head *uf)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	unsigned long rust_ret;
+
+	rust_ret = rust_mmap_region_dispatch(file, addr, len, &vma_flags, pgoff,
+					     uf, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mmap_region(file, addr, len, vma_flags, pgoff, uf);
 }
 
 /**

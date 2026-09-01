@@ -4,11 +4,12 @@
 //!
 //! Replaces the maple-tree walk in `unmapped_area()` / `unmapped_area_topdown()`
 //! with a first-fit (bottom-up or top-down) walk of existing VMAs, and
-//! sequences `do_mmap` (prepare vs `mmap_region`), `do_vmi_munmap` (range
+//! sequences `do_mmap` (prepare vs `mmap_region`), `mmap_region` (MDWE /
+//! writable vs merge vs new VMA vs complete), `do_vmi_munmap` (range
 //! check vs maple-tree unmap), `do_brk_flags` (expand vs new anonymous VMA),
 //! `do_mprotect_pkey` (validate vs VMA walk), `do_mremap` (move vs
 //! `mremap_to` vs `mremap_at`), and `do_madvise` (validate vs lock/walk).
-//! Maple-tree storage and the `mmap_region` / `mprotect_fixup` /
+//! Maple-tree storage and the merge / new-VMA / `mprotect_fixup` /
 //! page-table move / madvise VMA-walk bodies stay in C. The mmap lock is
 //! already held by the C caller except for mprotect, mremap, and madvise,
 //! which take it in apply / lock.
@@ -72,12 +73,24 @@ const MADVISE_DONE: i32 = 0;
 /// Range is valid; lock, walk VMAs, unlock.
 const MADVISE_APPLY: i32 = 1;
 
+/// Matches `RUST_MMAPREG_*` in `include/linux/mm.h`.
+const MMAPREG_DONE: i32 = 0;
+/// MDWE and writable checks passed; install then exit.
+const MMAPREG_INSTALL: i32 = 1;
+/// Setup succeeded; try merge or new.
+const MMAPREG_CONT: i32 = 2;
+/// Could not merge; allocate a new VMA.
+const MMAPREG_NEW: i32 = 3;
+/// Have a VMA; complete accounting and unmap.
+const MMAPREG_COMPLETE: i32 = 4;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
 static N_MPROTECT: Atomic<u32> = Atomic::new(0);
 static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
+static N_MMAPREG: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -266,7 +279,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -669,5 +682,132 @@ pub unsafe extern "C" fn rust_madvise_dispatch(
             pr_err!("rust-mmap: unknown madvise kind {kind}\n");
             EINVAL.to_errno()
         }
+    }
+}
+
+/// C ABI: sequence `mmap_region` after C checks MDWE and writable mappings.
+///
+/// Sets `*handled` once check has run. Install (merge vs new VMA) and
+/// writable-mapping cleanup stay in C helpers. Early check errors skip
+/// `validate_mm`, matching the original `mmap_region` returns.
+///
+/// # Safety
+///
+/// mmap write lock held as for `mmap_region`. `vma_flags` must be live.
+/// `file` and `uf` may be null. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mmap_region_dispatch(
+    file: *mut bindings::file,
+    addr: c_ulong,
+    len: c_ulong,
+    vma_flags: *mut bindings::vma_flags_t,
+    pgoff: c_ulong,
+    uf: *mut bindings::list_head,
+    handled: *mut c_int,
+) -> c_ulong {
+    if vma_flags.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_ulong;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_ulong = 0;
+    let mut writable: c_int = 0;
+    // SAFETY: mmap write lock held; `vma_flags` is the live bitmap.
+    let kind = unsafe { bindings::rust_mmapreg_check(file, vma_flags, &mut writable, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MMAPREG.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mmap_region sequenced\n");
+    }
+
+    if kind == MMAPREG_DONE {
+        return out;
+    }
+    if kind != MMAPREG_INSTALL {
+        pr_err!("rust-mmap: unknown mmap_region check kind {kind}\n");
+        return EINVAL.to_errno() as c_ulong;
+    }
+
+    // SAFETY: Checks passed; maple-tree install may nest inner dispatch.
+    let mapped = unsafe {
+        bindings::rust_mmapreg_install(file, addr, len, vma_flags, pgoff, uf)
+    };
+    // SAFETY: Writable mapping (if any) must be dropped; always validate.
+    unsafe { bindings::rust_mmapreg_exit(file, writable, mapped) }
+}
+
+/// C ABI: sequence `__mmap_region` setup vs merge vs new vs complete.
+///
+/// Sets `*handled` once setup has run (it may gather overlapping VMAs).
+/// Maple-tree merge and new-VMA store stay in C.
+///
+/// # Safety
+///
+/// mmap write lock held. `map` and `desc` must be the live stack state
+/// from `__mmap_region`. `uf` may be null. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mmapreg_inner_dispatch(
+    map: *mut bindings::mmap_state,
+    desc: *mut bindings::vm_area_desc,
+    uf: *mut bindings::list_head,
+    have_mmap_prepare: c_int,
+    handled: *mut c_int,
+) -> c_ulong {
+    if map.is_null() || desc.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_ulong;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_ulong = 0;
+    // SAFETY: `map`/`desc` are live stack objects; may unmap overlaps.
+    let kind =
+        unsafe { bindings::rust_mmapreg_setup(map, desc, uf, have_mmap_prepare, &mut out) };
+    // Setup gathers overlapping VMAs; C must not re-setup.
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    if kind == MMAPREG_DONE {
+        // SAFETY: Setup failed; abort gathered unmaps.
+        unsafe { bindings::rust_mmapreg_abort(map) };
+        return out;
+    }
+    if kind != MMAPREG_CONT {
+        pr_err!("rust-mmap: unknown mmap_region setup kind {kind}\n");
+        unsafe { bindings::rust_mmapreg_abort(map) };
+        return EINVAL.to_errno() as c_ulong;
+    }
+
+    let mut vma = ptr::null_mut();
+    // SAFETY: Setup succeeded; try to merge with adjacent VMAs.
+    let kind = unsafe { bindings::rust_mmapreg_merge(map, &mut vma) };
+    let mut allocated: c_int = 0;
+    if kind == MMAPREG_NEW {
+        // SAFETY: Need a new VMA; maple-tree store stays in C.
+        let kind = unsafe { bindings::rust_mmapreg_new(map, desc, &mut vma, &mut out) };
+        if kind == MMAPREG_DONE {
+            // SAFETY: New VMA failed after accounting; uncharge and abort.
+            unsafe { bindings::rust_mmapreg_unacct_abort(map) };
+            return out;
+        }
+        if kind != MMAPREG_COMPLETE {
+            pr_err!("rust-mmap: unknown mmap_region new kind {kind}\n");
+            unsafe { bindings::rust_mmapreg_unacct_abort(map) };
+            return EINVAL.to_errno() as c_ulong;
+        }
+        allocated = 1;
+    } else if kind != MMAPREG_COMPLETE {
+        pr_err!("rust-mmap: unknown mmap_region merge kind {kind}\n");
+        unsafe { bindings::rust_mmapreg_unacct_abort(map) };
+        return EINVAL.to_errno() as c_ulong;
+    }
+
+    // SAFETY: `vma` is the merged or newly stored mapping.
+    unsafe {
+        bindings::rust_mmapreg_complete(map, vma, desc, have_mmap_prepare, allocated)
     }
 }
