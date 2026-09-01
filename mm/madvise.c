@@ -1982,7 +1982,26 @@ static int madvise_do_behavior(unsigned long start, size_t len_in,
  *  -EAGAIN - a kernel resource was temporarily unavailable.
  *  -EPERM  - memory is sealed.
  */
-int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior)
+#define MADVISE_DONE		0
+#define MADVISE_APPLY		1
+
+static int madvise_prepare(unsigned long start, size_t len_in, int behavior,
+			   int *out)
+{
+	*out = 0;
+	if (!madvise_behavior_valid(behavior)) {
+		*out = -EINVAL;
+		return MADVISE_DONE;
+	}
+
+	*out = check_input_range(start, len_in);
+	if (*out || !len_in)
+		return MADVISE_DONE;
+	return MADVISE_APPLY;
+}
+
+static int madvise_apply(struct mm_struct *mm, unsigned long start,
+			 size_t len_in, int behavior)
 {
 	int error;
 	struct mmu_gather tlb;
@@ -1992,13 +2011,6 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 		.tlb = &tlb,
 	};
 
-	if (!madvise_behavior_valid(behavior))
-		return -EINVAL;
-
-	error = check_input_range(start, len_in);
-	if (error || !len_in)
-		return error;
-
 	error = madvise_lock(&madv_behavior);
 	if (error)
 		return error;
@@ -2006,8 +2018,46 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	error = madvise_do_behavior(start, len_in, &madv_behavior);
 	madvise_finish_tlb(&madv_behavior);
 	madvise_unlock(&madv_behavior);
-
 	return error;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_madvise_prepare(unsigned long start, size_t len_in, int behavior,
+			 int *out)
+{
+	return madvise_prepare(start, len_in, behavior, out);
+}
+
+int rust_madvise_apply(struct mm_struct *mm, unsigned long start,
+		       size_t len_in, int behavior)
+{
+	return madvise_apply(mm, start, len_in, behavior);
+}
+#endif
+
+static int finish_madvise(struct mm_struct *mm, unsigned long start,
+			  size_t len_in, int behavior)
+{
+	int out = 0;
+	int kind;
+
+	kind = madvise_prepare(start, len_in, behavior, &out);
+	if (kind == MADVISE_DONE)
+		return out;
+	return madvise_apply(mm, start, len_in, behavior);
+}
+
+int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_madvise_dispatch(mm, start, len_in, behavior, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_madvise(mm, start, len_in, behavior);
 }
 
 SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)

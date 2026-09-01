@@ -4373,6 +4373,28 @@ struct rust_mprotect_req {
 int rust_mprotect_dispatch(struct rust_mprotect_req *req, int *handled);
 int rust_mprotect_validate(struct rust_mprotect_req *req, int *out);
 int rust_mprotect_apply(struct rust_mprotect_req *req);
+struct vma_remap_struct;
+#define RUST_MREMAP_DONE	0
+#define RUST_MREMAP_CONT	1
+#define RUST_MREMAP_MOVE	2
+#define RUST_MREMAP_TO		3
+#define RUST_MREMAP_AT		4
+unsigned long rust_mremap_dispatch(struct vma_remap_struct *vrm, int *handled);
+int rust_mremap_prepare(struct vma_remap_struct *vrm, unsigned long *out);
+int rust_mremap_lock(struct vma_remap_struct *vrm, unsigned long *out);
+int rust_mremap_classify(struct vma_remap_struct *vrm, unsigned long *out);
+unsigned long rust_mremap_move(struct vma_remap_struct *vrm);
+unsigned long rust_mremap_to(struct vma_remap_struct *vrm);
+unsigned long rust_mremap_at(struct vma_remap_struct *vrm);
+unsigned long rust_mremap_exit(struct vma_remap_struct *vrm, unsigned long res);
+#define RUST_MADVISE_DONE	0
+#define RUST_MADVISE_APPLY	1
+int rust_madvise_dispatch(struct mm_struct *mm, unsigned long start,
+			  size_t len_in, int behavior, int *handled);
+int rust_madvise_prepare(unsigned long start, size_t len_in, int behavior,
+			 int *out);
+int rust_madvise_apply(struct mm_struct *mm, unsigned long start,
+		       size_t len_in, int behavior);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

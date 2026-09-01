@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Userspace VA search and mmap/munmap/brk/mprotect dispatch when
-//! `CONFIG_RUST_MMAP=y`.
+//! Userspace VA search and mmap-family dispatch when `CONFIG_RUST_MMAP=y`.
 //!
 //! Replaces the maple-tree walk in `unmapped_area()` / `unmapped_area_topdown()`
 //! with a first-fit (bottom-up or top-down) walk of existing VMAs, and
 //! sequences `do_mmap` (prepare vs `mmap_region`), `do_vmi_munmap` (range
 //! check vs maple-tree unmap), `do_brk_flags` (expand vs new anonymous VMA),
-//! and `do_mprotect_pkey` (validate vs VMA walk). Maple-tree storage and
-//! the `mmap_region` / `mprotect_fixup` bodies stay in C. The mmap lock is
-//! already held by the C caller except for mprotect, which takes it in
-//! apply.
+//! `do_mprotect_pkey` (validate vs VMA walk), `do_mremap` (move vs
+//! `mremap_to` vs `mremap_at`), and `do_madvise` (validate vs lock/walk).
+//! Maple-tree storage and the `mmap_region` / `mprotect_fixup` /
+//! page-table move / madvise VMA-walk bodies stay in C. The mmap lock is
+//! already held by the C caller except for mprotect, mremap, and madvise,
+//! which take it in apply / lock.
 
 use crate::{
     bindings,
@@ -55,10 +56,28 @@ const MPROTECT_DONE: i32 = 0;
 /// Range is valid; lock and walk VMAs.
 const MPROTECT_APPLY: i32 = 1;
 
+/// Matches `RUST_MREMAP_*` in `include/linux/mm.h`.
+const MREMAP_DONE: i32 = 0;
+/// Params ok, or mmap write lock taken.
+const MREMAP_CONT: i32 = 1;
+/// Batched multi-VMA move (`remap_move`).
+const MREMAP_MOVE: i32 = 2;
+/// Move or grow to a new address (`mremap_to`).
+const MREMAP_TO: i32 = 3;
+/// Shrink or expand in place (`mremap_at`).
+const MREMAP_AT: i32 = 4;
+
+/// Matches `RUST_MADVISE_*` in `include/linux/mm.h`.
+const MADVISE_DONE: i32 = 0;
+/// Range is valid; lock, walk VMAs, unlock.
+const MADVISE_APPLY: i32 = 1;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
 static N_MPROTECT: Atomic<u32> = Atomic::new(0);
+static N_MREMAP: Atomic<u32> = Atomic::new(0);
+static N_MADVISE: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -245,9 +264,9 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
     None
 }
 
-/// Log that Rust is serving `vm_unmapped_area` and mmap/munmap/brk/mprotect.
+/// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -534,6 +553,120 @@ pub unsafe extern "C" fn rust_mprotect_dispatch(
         MPROTECT_APPLY => unsafe { bindings::rust_mprotect_apply(req) },
         _ => {
             pr_err!("rust-mmap: unknown mprotect kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `do_mremap` after C aligns lengths and takes the lock.
+///
+/// Sets `*handled` once prepare has run. Lock-fail and map-count-fail
+/// return without `notify_uffd`. Prep-fail and the move/to/at paths
+/// go through `mremap_exit` (unlock + populate + uffd).
+///
+/// # Safety
+///
+/// `vrm` must be the live `vma_remap_struct` from `do_mremap`. `handled`
+/// must be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mremap_dispatch(
+    vrm: *mut bindings::vma_remap_struct,
+    handled: *mut c_int,
+) -> c_ulong {
+    if vrm.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_ulong;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_ulong = 0;
+    // SAFETY: No mmap lock yet; `vrm` holds the syscall arguments.
+    let kind = unsafe { bindings::rust_mremap_prepare(vrm, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MREMAP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mremap sequenced\n");
+    }
+
+    if kind == MREMAP_DONE {
+        return out;
+    }
+    if kind != MREMAP_CONT {
+        pr_err!("rust-mmap: unknown mremap prepare kind {kind}\n");
+        return EINVAL.to_errno() as c_ulong;
+    }
+
+    // SAFETY: Params passed; take the mmap write lock.
+    let kind = unsafe { bindings::rust_mremap_lock(vrm, &mut out) };
+    if kind == MREMAP_DONE {
+        return out;
+    }
+    if kind != MREMAP_CONT {
+        pr_err!("rust-mmap: unknown mremap lock kind {kind}\n");
+        return EINVAL.to_errno() as c_ulong;
+    }
+
+    // SAFETY: mmap write lock held; classify move vs to vs at.
+    let kind = unsafe { bindings::rust_mremap_classify(vrm, &mut out) };
+    let res = match kind {
+        MREMAP_DONE => out,
+        // SAFETY: Locked; batched move of equal-length mappings.
+        MREMAP_MOVE => unsafe { bindings::rust_mremap_move(vrm) },
+        // SAFETY: Locked; grow or relocate to a new address.
+        MREMAP_TO => unsafe { bindings::rust_mremap_to(vrm) },
+        // SAFETY: Locked; shrink or expand in place.
+        MREMAP_AT => unsafe { bindings::rust_mremap_at(vrm) },
+        _ => {
+            pr_err!("rust-mmap: unknown mremap classify kind {kind}\n");
+            EINVAL.to_errno() as c_ulong
+        }
+    };
+    // SAFETY: Lock was taken; unlock, maybe populate, always notify uffd.
+    unsafe { bindings::rust_mremap_exit(vrm, res) }
+}
+
+/// C ABI: sequence `do_madvise` after C validates behavior and range.
+///
+/// Sets `*handled` once prepare has run. Lock, TLB gather, VMA walk,
+/// and unlock stay in C apply.
+///
+/// # Safety
+///
+/// `mm` must be a live mm. `handled` must be a valid out-parameter.
+/// No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_madvise_dispatch(
+    mm: *mut bindings::mm_struct,
+    start: c_ulong,
+    len_in: usize,
+    behavior: c_int,
+    handled: *mut c_int,
+) -> c_int {
+    if mm.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; range and behavior are syscall args.
+    let kind = unsafe { bindings::rust_madvise_prepare(start, len_in, behavior, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MADVISE.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first madvise sequenced\n");
+    }
+
+    match kind {
+        MADVISE_DONE => out,
+        // SAFETY: Range is valid; apply takes the appropriate mmap lock.
+        MADVISE_APPLY => unsafe { bindings::rust_madvise_apply(mm, start, len_in, behavior) },
+        _ => {
+            pr_err!("rust-mmap: unknown madvise kind {kind}\n");
             EINVAL.to_errno()
         }
     }

@@ -1974,52 +1974,149 @@ static unsigned long remap_move(struct vma_remap_struct *vrm)
 	return res;
 }
 
-static unsigned long do_mremap(struct vma_remap_struct *vrm)
-{
-	struct mm_struct *mm = current->mm;
-	unsigned long res;
-	bool failed;
+#define MREMAP_DONE		0
+#define MREMAP_CONT		1
+#define MREMAP_MOVE		2
+#define MREMAP_TO		3
+#define MREMAP_AT		4
 
+static int mremap_prepare(struct vma_remap_struct *vrm, unsigned long *out)
+{
+	*out = 0;
 	vrm->old_len = PAGE_ALIGN(vrm->old_len);
 	vrm->new_len = PAGE_ALIGN(vrm->new_len);
 
-	res = check_mremap_params(vrm);
-	if (res)
-		return res;
+	*out = check_mremap_params(vrm);
+	if (*out)
+		return MREMAP_DONE;
+	return MREMAP_CONT;
+}
 
-	if (mmap_write_lock_killable(mm))
-		return -EINTR;
+static int mremap_lock(struct vma_remap_struct *vrm, unsigned long *out)
+{
+	struct mm_struct *mm = current->mm;
+
+	*out = 0;
+	if (mmap_write_lock_killable(mm)) {
+		*out = -EINTR;
+		return MREMAP_DONE;
+	}
 	vrm->mmap_locked = true;
 
 	if (!check_map_count_against_split_early()) {
 		mmap_write_unlock(mm);
-		return -ENOMEM;
+		vrm->mmap_locked = false;
+		*out = -ENOMEM;
+		return MREMAP_DONE;
 	}
+	return MREMAP_CONT;
+}
 
-	if (vrm_move_only(vrm)) {
-		res = remap_move(vrm);
-	} else {
-		vrm->vma = vma_lookup(current->mm, vrm->addr);
-		res = check_prep_vma(vrm);
-		if (res)
-			goto out;
+static int mremap_classify(struct vma_remap_struct *vrm, unsigned long *out)
+{
+	int err;
 
-		/* Actually execute mremap. */
-		res = vrm_implies_new_addr(vrm) ? mremap_to(vrm) : mremap_at(vrm);
+	*out = 0;
+	if (vrm_move_only(vrm))
+		return MREMAP_MOVE;
+
+	vrm->vma = vma_lookup(current->mm, vrm->addr);
+	err = check_prep_vma(vrm);
+	if (err) {
+		*out = err;
+		return MREMAP_DONE;
 	}
+	if (vrm_implies_new_addr(vrm))
+		return MREMAP_TO;
+	return MREMAP_AT;
+}
 
-out:
-	failed = IS_ERR_VALUE(res);
+static unsigned long mremap_exit(struct vma_remap_struct *vrm, unsigned long res)
+{
+	bool failed = IS_ERR_VALUE(res);
 
 	if (vrm->mmap_locked)
-		mmap_write_unlock(mm);
+		mmap_write_unlock(current->mm);
 
-	/* VMA mlock'd + was expanded, so populated expanded region. */
 	if (!failed && vrm->populate_expand)
 		mm_populate(vrm->new_addr + vrm->old_len, vrm->delta);
 
 	notify_uffd(vrm, failed);
 	return res;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mremap_prepare(struct vma_remap_struct *vrm, unsigned long *out)
+{
+	return mremap_prepare(vrm, out);
+}
+
+int rust_mremap_lock(struct vma_remap_struct *vrm, unsigned long *out)
+{
+	return mremap_lock(vrm, out);
+}
+
+int rust_mremap_classify(struct vma_remap_struct *vrm, unsigned long *out)
+{
+	return mremap_classify(vrm, out);
+}
+
+unsigned long rust_mremap_move(struct vma_remap_struct *vrm)
+{
+	return remap_move(vrm);
+}
+
+unsigned long rust_mremap_to(struct vma_remap_struct *vrm)
+{
+	return mremap_to(vrm);
+}
+
+unsigned long rust_mremap_at(struct vma_remap_struct *vrm)
+{
+	return mremap_at(vrm);
+}
+
+unsigned long rust_mremap_exit(struct vma_remap_struct *vrm, unsigned long res)
+{
+	return mremap_exit(vrm, res);
+}
+#endif
+
+static unsigned long finish_mremap(struct vma_remap_struct *vrm)
+{
+	unsigned long out = 0;
+	int kind;
+	unsigned long res;
+
+	kind = mremap_prepare(vrm, &out);
+	if (kind == MREMAP_DONE)
+		return out;
+	kind = mremap_lock(vrm, &out);
+	if (kind == MREMAP_DONE)
+		return out;
+	kind = mremap_classify(vrm, &out);
+	if (kind == MREMAP_DONE)
+		res = out;
+	else if (kind == MREMAP_MOVE)
+		res = remap_move(vrm);
+	else if (kind == MREMAP_TO)
+		res = mremap_to(vrm);
+	else
+		res = mremap_at(vrm);
+	return mremap_exit(vrm, res);
+}
+
+static unsigned long do_mremap(struct vma_remap_struct *vrm)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	unsigned long rust_ret;
+
+	rust_ret = rust_mremap_dispatch(vrm, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mremap(vrm);
 }
 
 /*
