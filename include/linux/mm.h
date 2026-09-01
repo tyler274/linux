@@ -4428,6 +4428,24 @@ unsigned long rust_mmapreg_complete(struct mmap_state *map,
 				    int have_mmap_prepare, int allocated_new);
 void rust_mmapreg_abort(struct mmap_state *map);
 void rust_mmapreg_unacct_abort(struct mmap_state *map);
+struct vma_merge_struct;
+#define RUST_VMERGE_NONE	0
+#define RUST_VMERGE_EXPAND	1
+struct vm_area_struct *rust_vmerge_dispatch(struct vma_merge_struct *vmg,
+					    int *handled);
+int rust_vmerge_classify(struct vma_merge_struct *vmg);
+struct vm_area_struct *rust_vmerge_expand(struct vma_merge_struct *vmg);
+struct rust_mnva_state;
+#define RUST_MNVA_DONE		0
+#define RUST_MNVA_FILE		1
+#define RUST_MNVA_SHMEM		2
+#define RUST_MNVA_STORE		3
+int rust_mnva_dispatch(struct rust_mnva_state *s, int *handled);
+int rust_mnva_classify(struct rust_mnva_state *s, int *out);
+int rust_mnva_file(struct rust_mnva_state *s);
+int rust_mnva_shmem(struct rust_mnva_state *s);
+int rust_mnva_store(struct rust_mnva_state *s);
+void rust_mnva_abort(struct rust_mnva_state *s);
 struct rust_mpfix_state;
 #define RUST_MPFIX_DONE		0
 #define RUST_MPFIX_MODIFY	1

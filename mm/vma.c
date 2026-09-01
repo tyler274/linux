@@ -1137,7 +1137,10 @@ abort:
  * - The caller must have specified the next vma in @vmg->next.
  * - The caller must have positioned the vmi at or before the gap.
  */
-struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
+#define VMERGE_NONE		0
+#define VMERGE_EXPAND		1
+
+static int vmerge_classify(struct vma_merge_struct *vmg)
 {
 	struct vm_area_struct *prev = vmg->prev;
 	struct vm_area_struct *next = vmg->next;
@@ -1155,7 +1158,7 @@ struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
 	/* Special VMAs are unmergeable, also if no prev/next. */
 	if (vma_flags_test_any_mask(&vmg->vma_flags, VMA_SPECIAL_FLAGS) ||
 	    (!prev && !next))
-		return NULL;
+		return VMERGE_NONE;
 
 	can_merge_left = can_vma_merge_left(vmg);
 	can_merge_right = !vmg->just_expand && can_vma_merge_right(vmg, can_merge_left);
@@ -1188,6 +1191,13 @@ struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
 		}
 	}
 
+	if (vmg->target)
+		return VMERGE_EXPAND;
+	return VMERGE_NONE;
+}
+
+static struct vm_area_struct *vmerge_expand(struct vma_merge_struct *vmg)
+{
 	/*
 	 * Now try to expand adjacent VMA(s). This takes care of removing the
 	 * following VMA if we have VMAs on both sides.
@@ -1199,6 +1209,38 @@ struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
 	}
 
 	return NULL;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vmerge_classify(struct vma_merge_struct *vmg)
+{
+	return vmerge_classify(vmg);
+}
+
+struct vm_area_struct *rust_vmerge_expand(struct vma_merge_struct *vmg)
+{
+	return vmerge_expand(vmg);
+}
+#endif
+
+static struct vm_area_struct *finish_vmerge(struct vma_merge_struct *vmg)
+{
+	if (vmerge_classify(vmg) == VMERGE_EXPAND)
+		return vmerge_expand(vmg);
+	return NULL;
+}
+
+struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	struct vm_area_struct *rust_ret;
+
+	rust_ret = rust_vmerge_dispatch(vmg, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vmerge(vmg);
 }
 
 /*
@@ -2683,46 +2725,76 @@ static int __mmap_new_file_vma(struct mmap_state *map,
  *
  * Returns: Zero on success, or an error.
  */
-static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap,
-	struct mmap_action *action)
+#define MNVA_DONE		0
+#define MNVA_FILE		1
+#define MNVA_SHMEM		2
+#define MNVA_STORE		3
+
+struct rust_mnva_state {
+	struct mmap_state *map;
+	struct mmap_action *action;
+	struct vm_area_struct **vmap;
+	struct vm_area_struct *vma;
+};
+
+static int mnva_classify(struct rust_mnva_state *s, int *out)
 {
+	struct mmap_state *map = s->map;
+	struct vma_iterator *vmi = map->vmi;
 	const bool is_anon = !map->file &&
 		!vma_flags_test(&map->vma_flags, VMA_SHARED_BIT);
-	struct vma_iterator *vmi = map->vmi;
-	int error = 0;
-	struct vm_area_struct *vma;
+
+	*out = 0;
+	s->vma = NULL;
 
 	/*
 	 * Determine the object being mapped and call the appropriate
 	 * specific mapper. the address has already been validated, but
 	 * not unmapped, but the maps are removed from the list.
 	 */
-	vma = vm_area_alloc(map->mm);
-	if (!vma)
-		return -ENOMEM;
+	s->vma = vm_area_alloc(map->mm);
+	if (!s->vma) {
+		*out = -ENOMEM;
+		return MNVA_DONE;
+	}
 
 	vma_iter_config(vmi, map->addr, map->end);
 
 	if (is_anon)
-		vma_set_anonymous(vma);
+		vma_set_anonymous(s->vma);
 
-	vma_set_range(vma, map->addr, map->end, map->pgoff, map->anon_pgoff);
-	vma->flags = map->vma_flags;
-	vma->vm_page_prot = map->page_prot;
+	vma_set_range(s->vma, map->addr, map->end, map->pgoff, map->anon_pgoff);
+	s->vma->flags = map->vma_flags;
+	s->vma->vm_page_prot = map->page_prot;
 
-	if (vma_iter_prealloc(vmi, vma)) {
-		error = -ENOMEM;
-		goto free_vma;
+	if (vma_iter_prealloc(vmi, s->vma)) {
+		vm_area_free(s->vma);
+		s->vma = NULL;
+		*out = -ENOMEM;
+		return MNVA_DONE;
 	}
 
-	/* Invoke callbacks. */
 	if (map->file)
-		error = __mmap_new_file_vma(map, vma);
-	else if (!is_anon)
-		error = shmem_zero_setup(vma);
+		return MNVA_FILE;
+	if (!is_anon)
+		return MNVA_SHMEM;
+	return MNVA_STORE;
+}
 
-	if (error)
-		goto free_iter_vma;
+static int mnva_file(struct rust_mnva_state *s)
+{
+	return __mmap_new_file_vma(s->map, s->vma);
+}
+
+static int mnva_shmem(struct rust_mnva_state *s)
+{
+	return shmem_zero_setup(s->vma);
+}
+
+static int mnva_store(struct rust_mnva_state *s)
+{
+	struct mmap_state *map = s->map;
+	struct vm_area_struct *vma = s->vma;
 
 	if (!map->check_ksm_early) {
 		update_ksm_flags(map);
@@ -2736,9 +2808,9 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap,
 
 	/* Lock the VMA since it is modified after insertion into VMA tree */
 	vma_start_write(vma);
-	vma_iter_store_new(vmi, vma);
+	vma_iter_store_new(map->vmi, vma);
 	map->mm->map_count++;
-	vma_link_file(vma, action->hide_from_rmap_until_complete);
+	vma_link_file(vma, s->action->hide_from_rmap_until_complete);
 
 	/*
 	 * vma_merge_new_range() calls khugepaged_enter_vma() too, the below
@@ -2746,14 +2818,83 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap,
 	 */
 	if (!vma_is_anonymous(vma))
 		khugepaged_enter_vma(vma, map->vm_flags);
-	*vmap = vma;
+	*s->vmap = vma;
 	return 0;
+}
 
-free_iter_vma:
-	vma_iter_free(vmi);
-free_vma:
-	vm_area_free(vma);
-	return error;
+static void mnva_abort(struct rust_mnva_state *s)
+{
+	vma_iter_free(s->map->vmi);
+	vm_area_free(s->vma);
+	s->vma = NULL;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mnva_classify(struct rust_mnva_state *s, int *out)
+{
+	return mnva_classify(s, out);
+}
+
+int rust_mnva_file(struct rust_mnva_state *s)
+{
+	return mnva_file(s);
+}
+
+int rust_mnva_shmem(struct rust_mnva_state *s)
+{
+	return mnva_shmem(s);
+}
+
+int rust_mnva_store(struct rust_mnva_state *s)
+{
+	return mnva_store(s);
+}
+
+void rust_mnva_abort(struct rust_mnva_state *s)
+{
+	mnva_abort(s);
+}
+#endif
+
+static int finish_mnva(struct rust_mnva_state *s)
+{
+	int out = 0;
+	int kind;
+	int error;
+
+	kind = mnva_classify(s, &out);
+	if (kind == MNVA_DONE)
+		return out;
+	if (kind == MNVA_FILE)
+		error = mnva_file(s);
+	else if (kind == MNVA_SHMEM)
+		error = mnva_shmem(s);
+	else
+		error = 0;
+	if (error) {
+		mnva_abort(s);
+		return error;
+	}
+	return mnva_store(s);
+}
+
+static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap,
+	struct mmap_action *action)
+{
+	struct rust_mnva_state s = {
+		.map = map,
+		.action = action,
+		.vmap = vmap,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mnva_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mnva(&s);
 }
 
 /*

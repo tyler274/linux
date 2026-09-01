@@ -20,10 +20,11 @@
 //! (single-VMA readlock vs iter), `madvise_vma_behavior`
 //! (direct action vs ENOMEM convert vs `madvise_update_vma`), and
 //! `madvise_dontneed_free` (validate vs zap vs `MADV_FREE`), and
-//! `madvise_update_vma` (no-op vs name vs flags).
-//! Maple-tree storage and the merge / new-VMA / `change_protection` /
-//! page-table move / madvise per-hint / seal-range / mlock page-walk /
-//! msync / mincore walk bodies stay in C. The mmap lock is already
+//! `madvise_update_vma` (no-op vs name vs flags), `vma_merge_new_range`
+//! (no-merge vs expand), and `__mmap_new_vma` (file vs shmem vs store).
+//! Maple-tree expand/store and the merge / new-VMA file mmap/shmem /
+//! `change_protection` / page-table move / madvise per-hint / seal-range /
+//! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
 //! held by the C caller except for mprotect, mremap, madvise, mseal,
 //! mlock, munlock, mlockall, munlockall, msync, mincore, and
 //! vector_madvise, which take it in apply / lock.
@@ -97,6 +98,20 @@ const MMAPREG_CONT: i32 = 2;
 const MMAPREG_NEW: i32 = 3;
 /// Have a VMA; complete accounting and unmap.
 const MMAPREG_COMPLETE: i32 = 4;
+
+/// Matches `RUST_VMERGE_*` in `include/linux/mm.h`.
+const VMERGE_NONE: i32 = 0;
+/// Adjacent VMA selected; maple-tree expand.
+const VMERGE_EXPAND: i32 = 1;
+
+/// Matches `RUST_MNVA_*` in `include/linux/mm.h`.
+const MNVA_DONE: i32 = 0;
+/// File-backed; `mmap` callback then store.
+const MNVA_FILE: i32 = 1;
+/// Shared anonymous; `shmem_zero_setup` then store.
+const MNVA_SHMEM: i32 = 2;
+/// Anonymous private; maple-tree store.
+const MNVA_STORE: i32 = 3;
 
 /// Matches `RUST_MPFIX_*` in `include/linux/mm.h`.
 const MPFIX_DONE: i32 = 0;
@@ -198,6 +213,8 @@ static N_MPROTECT: Atomic<u32> = Atomic::new(0);
 static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
 static N_MMAPREG: Atomic<u32> = Atomic::new(0);
+static N_VMERGE: Atomic<u32> = Atomic::new(0);
+static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
 #[cfg(CONFIG_64BIT)]
 static N_MSEAL: Atomic<u32> = Atomic::new(0);
@@ -403,7 +420,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -866,7 +883,7 @@ pub unsafe extern "C" fn rust_mmap_region_dispatch(
 /// C ABI: sequence `__mmap_region` setup vs merge vs new vs complete.
 ///
 /// Sets `*handled` once setup has run (it may gather overlapping VMAs).
-/// Maple-tree merge and new-VMA store stay in C.
+/// Merge classify vs expand and new-VMA file/shmem vs store are nested.
 ///
 /// # Safety
 ///
@@ -1663,4 +1680,100 @@ pub unsafe extern "C" fn rust_mupd_dispatch(
             EINVAL.to_errno()
         }
     }
+}
+
+/// C ABI: sequence `vma_merge_new_range` after C classifies adjacency.
+///
+/// Sets `*handled` once classify has adjusted `vmg`. Maple-tree
+/// expand stays in C.
+///
+/// # Safety
+///
+/// `vmg` must be a live merge request with mmap write lock held.
+/// `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vmerge_dispatch(
+    vmg: *mut bindings::vma_merge_struct,
+    handled: *mut c_int,
+) -> *mut bindings::vm_area_struct {
+    if vmg.is_null() || handled.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: `vmg` is live; classify may adjust start/end/target.
+    let kind = unsafe { bindings::rust_vmerge_classify(vmg) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VMERGE.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_merge sequenced\n");
+    }
+
+    match kind {
+        VMERGE_NONE => ptr::null_mut(),
+        // SAFETY: Target selected; `vma_expand` stays in C.
+        VMERGE_EXPAND => unsafe { bindings::rust_vmerge_expand(vmg) },
+        _ => {
+            pr_err!("rust-mmap: unknown vma_merge kind {kind}\n");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// C ABI: sequence `__mmap_new_vma` after C allocates and preallocates.
+///
+/// Sets `*handled` once classify has run. File `mmap`, shmem setup,
+/// and maple-tree store stay in C. Unknown kind after a successful
+/// prealloc aborts the iterator and frees the VMA.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_mnva_state` from `__mmap_new_vma`. mmap
+/// write lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mnva_dispatch(
+    s: *mut bindings::rust_mnva_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may alloc a VMA and prealloc the iterator.
+    let kind = unsafe { bindings::rust_mnva_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MNVA.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mmap_new sequenced\n");
+    }
+
+    let callback_err = match kind {
+        MNVA_DONE => return out,
+        // SAFETY: File-backed mapping; driver mmap stays in C.
+        MNVA_FILE => unsafe { bindings::rust_mnva_file(s) },
+        // SAFETY: Shared anonymous; shmem setup stays in C.
+        MNVA_SHMEM => unsafe { bindings::rust_mnva_shmem(s) },
+        MNVA_STORE => 0,
+        _ => {
+            pr_err!("rust-mmap: unknown mmap_new kind {kind}\n");
+            // SAFETY: Prealloc succeeded; drop the iterator and VMA.
+            unsafe { bindings::rust_mnva_abort(s) };
+            return EINVAL.to_errno();
+        }
+    };
+    if callback_err != 0 {
+        // SAFETY: File/shmem failed after prealloc; free iterator and VMA.
+        unsafe { bindings::rust_mnva_abort(s) };
+        return callback_err;
+    }
+    // SAFETY: Callbacks succeeded (or anon); insert into the maple tree.
+    unsafe { bindings::rust_mnva_store(s) }
 }
