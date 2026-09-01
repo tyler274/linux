@@ -1413,16 +1413,32 @@ static struct vm_area_struct *vma_merge_copied_range(struct vma_merge_struct *vm
  * - The caller must hold a WRITE lock on the mm_struct->mmap_lock.
  * - The caller must have set @vmg->target and @vmg->next.
  */
-int vma_expand(struct vma_merge_struct *vmg)
+#define VEXP_DONE		0
+#define VEXP_COMMIT		1
+
+struct rust_vexp_state {
+	struct vma_merge_struct *vmg;
+	struct vm_area_struct *anon_dup;
+	struct vm_area_struct *target;
+	struct vm_area_struct *next;
+	vma_flags_t sticky_flags;
+	bool remove_next;
+};
+
+static int vexp_classify(struct rust_vexp_state *s, int *out)
 {
-	struct vm_area_struct *anon_dup = NULL;
+	struct vma_merge_struct *vmg = s->vmg;
 	struct vm_area_struct *target = vmg->target;
 	struct vm_area_struct *next = vmg->next;
-	bool remove_next = false;
-	vma_flags_t sticky_flags =
-		vma_flags_and_mask(&vmg->vma_flags, VMA_STICKY_FLAGS);
 	vma_flags_t target_sticky;
 	int ret = 0;
+
+	*out = 0;
+	s->anon_dup = NULL;
+	s->target = target;
+	s->next = next;
+	s->remove_next = false;
+	s->sticky_flags = vma_flags_and_mask(&vmg->vma_flags, VMA_STICKY_FLAGS);
 
 	mmap_assert_write_locked(vmg->mm);
 	vma_start_write(target);
@@ -1430,20 +1446,20 @@ int vma_expand(struct vma_merge_struct *vmg)
 	target_sticky = vma_flags_and_mask(&target->flags, VMA_STICKY_FLAGS);
 
 	if (next && target != next && vmg->end == next->vm_end)
-		remove_next = true;
+		s->remove_next = true;
 
 	/* We must have a target. */
 	VM_WARN_ON_VMG(!target, vmg);
 	/* This should have already been checked by this point. */
-	VM_WARN_ON_VMG(remove_next && !can_merge_remove_vma(next), vmg);
+	VM_WARN_ON_VMG(s->remove_next && !can_merge_remove_vma(next), vmg);
 	/* Not merging but overwriting any part of next is not handled. */
-	VM_WARN_ON_VMG(next && !remove_next &&
+	VM_WARN_ON_VMG(next && !s->remove_next &&
 		       next != target && vmg->end > next->vm_start, vmg);
 	/* Only handles expanding. */
 	VM_WARN_ON_VMG(target->vm_start < vmg->start ||
 		       target->vm_end > vmg->end, vmg);
 
-	vma_flags_set_mask(&sticky_flags, target_sticky);
+	vma_flags_set_mask(&s->sticky_flags, target_sticky);
 
 	/*
 	 * If we are removing the next VMA or copying from a VMA
@@ -1452,39 +1468,94 @@ int vma_expand(struct vma_merge_struct *vmg)
 	 * Note that, by convention, callers ignore OOM for this case, so
 	 * we don't need to account for vmg->give_up_on_mm here.
 	 */
-	if (remove_next)
-		ret = dup_anon_vma(target, next, &anon_dup);
+	if (s->remove_next)
+		ret = dup_anon_vma(target, next, &s->anon_dup);
 	if (!ret && vmg->copied_from)
-		ret = dup_anon_vma(target, vmg->copied_from, &anon_dup);
-	if (ret)
-		return ret;
+		ret = dup_anon_vma(target, vmg->copied_from, &s->anon_dup);
+	if (ret) {
+		*out = ret;
+		return VEXP_DONE;
+	}
+	return VEXP_COMMIT;
+}
 
-	if (remove_next) {
+static int vexp_commit(struct rust_vexp_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+
+	if (s->remove_next) {
 		vma_flags_t next_sticky;
 
-		vma_start_write(next);
+		vma_start_write(s->next);
 		vmg->__remove_next = true;
 
-		next_sticky = vma_flags_and_mask(&next->flags, VMA_STICKY_FLAGS);
-		vma_flags_set_mask(&sticky_flags, next_sticky);
+		next_sticky = vma_flags_and_mask(&s->next->flags, VMA_STICKY_FLAGS);
+		vma_flags_set_mask(&s->sticky_flags, next_sticky);
 	}
 	if (commit_merge(vmg))
-		goto nomem;
+		return -ENOMEM;
 
-	vma_set_flags_mask(target, sticky_flags);
+	vma_set_flags_mask(s->target, s->sticky_flags);
 	return 0;
+}
 
-nomem:
-	if (anon_dup)
-		unlink_anon_vmas(anon_dup);
+static void vexp_abort(struct rust_vexp_state *s)
+{
+	if (s->anon_dup)
+		unlink_anon_vmas(s->anon_dup);
 	/*
 	 * If the user requests that we just give upon OOM, we are safe to do so
 	 * here, as commit merge provides this contract to us. Nothing has been
 	 * changed - no harm no foul, just don't report it.
 	 */
-	if (!vmg->give_up_on_oom)
-		vmg->state = VMA_MERGE_ERROR_NOMEM;
-	return -ENOMEM;
+	if (!s->vmg->give_up_on_oom)
+		s->vmg->state = VMA_MERGE_ERROR_NOMEM;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vexp_classify(struct rust_vexp_state *s, int *out)
+{
+	return vexp_classify(s, out);
+}
+
+int rust_vexp_commit(struct rust_vexp_state *s)
+{
+	return vexp_commit(s);
+}
+
+void rust_vexp_abort(struct rust_vexp_state *s)
+{
+	vexp_abort(s);
+}
+#endif
+
+static int finish_vexp(struct rust_vexp_state *s)
+{
+	int out = 0;
+
+	if (vexp_classify(s, &out) == VEXP_DONE)
+		return out;
+	if (vexp_commit(s)) {
+		vexp_abort(s);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+int vma_expand(struct vma_merge_struct *vmg)
+{
+	struct rust_vexp_state s = {
+		.vmg = vmg,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_vexp_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vexp(&s);
 }
 
 /**

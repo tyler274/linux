@@ -24,14 +24,15 @@
 //! (no-merge vs expand), `__mmap_new_vma` (file vs shmem vs store),
 //! `brk` (shrink vs expand vs unlock/populate), `process_madvise`
 //! (pidfd/iovec vs vector walk), `vm_brk_flags` (lock/limits vs munmap
-//! vs do_brk vs populate), and `vma_merge_existing_range` (no-merge vs
-//! both/left/right).
+//! vs do_brk vs populate), `vma_merge_existing_range` (no-merge vs
+//! both/left/right), `vma_expand` (dup vs commit), and `expand_stack`
+//! (found vs grow-up vs grow-down).
 //! Maple-tree expand/store and the merge / new-VMA file mmap/shmem /
 //! `change_protection` / page-table move / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
 //! held by the C caller except for mprotect, mremap, madvise, mseal,
-//! mlock, munlock, mlockall, munlockall, msync, mincore, and
-//! vector_madvise, which take it in apply / lock.
+//! mlock, munlock, mlockall, munlockall, msync, mincore,
+//! vector_madvise, and `expand_stack`, which take it in apply / lock.
 
 use crate::{
     bindings,
@@ -94,6 +95,16 @@ const VEX_BOTH: i32 = 1;
 const VEX_LEFT: i32 = 2;
 /// Merge next into middle.
 const VEX_RIGHT: i32 = 3;
+
+/// Matches `RUST_VEXP_*` in `include/linux/mm.h`.
+const VEXP_DONE: i32 = 0;
+/// Anon vmas cloned; maple-tree `commit_merge`.
+const VEXP_COMMIT: i32 = 1;
+
+/// Matches `RUST_ESTK_*` in `include/linux/mm.h`.
+const ESTK_DONE: i32 = 0;
+/// VMA found or grown; downgrade write to read.
+const ESTK_DOWNGRADE: i32 = 1;
 
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
@@ -244,6 +255,8 @@ static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
 static N_MMAPREG: Atomic<u32> = Atomic::new(0);
 static N_VMERGE: Atomic<u32> = Atomic::new(0);
+static N_VEXP: Atomic<u32> = Atomic::new(0);
+static N_ESTK: Atomic<u32> = Atomic::new(0);
 static N_VEX: Atomic<u32> = Atomic::new(0);
 static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
@@ -452,7 +465,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1746,7 +1759,7 @@ pub unsafe extern "C" fn rust_vmerge_dispatch(
 
     match kind {
         VMERGE_NONE => ptr::null_mut(),
-        // SAFETY: Target selected; `vma_expand` stays in C.
+        // SAFETY: Target selected; nested `vma_expand` is Rust-sequenced.
         VMERGE_EXPAND => unsafe { bindings::rust_vmerge_expand(vmg) },
         _ => {
             pr_err!("rust-mmap: unknown vma_merge kind {kind}\n");
@@ -2006,4 +2019,101 @@ pub unsafe extern "C" fn rust_vex_dispatch(
         return ptr::null_mut();
     }
     committed
+}
+
+/// C ABI: sequence `vma_expand` after C clones anon_vmas.
+///
+/// Sets `*handled` once classify has run. Maple-tree `commit_merge`
+/// stays in C. Unknown kind or a failed commit unlinks a partial
+/// anon_vma clone.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vexp_state` with `vmg` filled. mmap write
+/// lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vexp_dispatch(
+    s: *mut bindings::rust_vexp_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may take VMA write locks and dup.
+    let kind = unsafe { bindings::rust_vexp_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VEXP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_expand sequenced\n");
+    }
+
+    match kind {
+        VEXP_DONE => out,
+        VEXP_COMMIT => {
+            // SAFETY: Anon vmas cloned; maple-tree commit stays in C.
+            let err = unsafe { bindings::rust_vexp_commit(s) };
+            if err != 0 {
+                // SAFETY: commit_merge failed; unlink the clone.
+                unsafe { bindings::rust_vexp_abort(s) };
+            }
+            err
+        }
+        _ => {
+            pr_err!("rust-mmap: unknown vma_expand kind {kind}\n");
+            // SAFETY: Classify may have cloned anon_vma.
+            unsafe { bindings::rust_vexp_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `expand_stack` after C drops the mmap read lock.
+///
+/// Sets `*handled` once classify has taken the write lock (or failed
+/// to). Grow-up / grow-down stay in C. Unknown kind drops a leftover
+/// write lock.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_estk_state` with `mm` and `addr` filled.
+/// mmap read lock held on entry. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_estk_dispatch(
+    s: *mut bindings::rust_estk_state,
+    handled: *mut c_int,
+) -> *mut bindings::vm_area_struct {
+    if s.is_null() || handled.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: `s` is live; classify drops the read lock and may grow.
+    let kind = unsafe { bindings::rust_estk_classify(s) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_ESTK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first expand_stack sequenced\n");
+    }
+
+    match kind {
+        ESTK_DONE => ptr::null_mut(),
+        // SAFETY: Write lock held; downgrade to read.
+        ESTK_DOWNGRADE => unsafe { bindings::rust_estk_downgrade(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown expand_stack kind {kind}\n");
+            // SAFETY: Drop a leftover write lock.
+            unsafe { bindings::rust_estk_abort(s) };
+            ptr::null_mut()
+        }
+    }
 }

@@ -4372,6 +4372,14 @@ int rust_vmbrk_dispatch(struct rust_vmbrk_state *s, int *handled);
 int rust_vmbrk_classify(struct rust_vmbrk_state *s, int *out);
 int rust_vmbrk_exit(struct rust_vmbrk_state *s);
 void rust_vmbrk_abort(struct rust_vmbrk_state *s);
+struct rust_estk_state;
+#define RUST_ESTK_DONE		0
+#define RUST_ESTK_DOWNGRADE	1
+struct vm_area_struct *rust_estk_dispatch(struct rust_estk_state *s,
+					  int *handled);
+int rust_estk_classify(struct rust_estk_state *s);
+struct vm_area_struct *rust_estk_downgrade(struct rust_estk_state *s);
+void rust_estk_abort(struct rust_estk_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;
@@ -4449,6 +4457,13 @@ struct vm_area_struct *rust_vmerge_dispatch(struct vma_merge_struct *vmg,
 					    int *handled);
 int rust_vmerge_classify(struct vma_merge_struct *vmg);
 struct vm_area_struct *rust_vmerge_expand(struct vma_merge_struct *vmg);
+struct rust_vexp_state;
+#define RUST_VEXP_DONE		0
+#define RUST_VEXP_COMMIT	1
+int rust_vexp_dispatch(struct rust_vexp_state *s, int *handled);
+int rust_vexp_classify(struct rust_vexp_state *s, int *out);
+int rust_vexp_commit(struct rust_vexp_state *s);
+void rust_vexp_abort(struct rust_vexp_state *s);
 struct rust_vex_state;
 #define RUST_VEX_NONE		0
 #define RUST_VEX_BOTH		1

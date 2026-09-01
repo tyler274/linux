@@ -1251,32 +1251,102 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *mm, unsigned lon
  * If no vma is found or it can't be expanded, it returns NULL and has
  * dropped the lock.
  */
-struct vm_area_struct *expand_stack(struct mm_struct *mm, unsigned long addr)
+#define ESTK_DONE		0
+#define ESTK_DOWNGRADE		1
+
+struct rust_estk_state {
+	struct mm_struct *mm;
+	unsigned long addr;
+	struct vm_area_struct *vma;
+	bool locked;
+};
+
+static int estk_classify(struct rust_estk_state *s)
 {
 	struct vm_area_struct *vma, *prev;
 
-	mmap_read_unlock(mm);
-	if (mmap_write_lock_killable(mm))
-		return NULL;
+	s->vma = NULL;
+	s->locked = false;
 
-	vma = find_vma_prev(mm, addr, &prev);
-	if (vma && vma->vm_start <= addr)
-		goto success;
+	mmap_read_unlock(s->mm);
+	if (mmap_write_lock_killable(s->mm))
+		return ESTK_DONE;
+	s->locked = true;
 
-	if (prev && !vma_expand_up(prev, addr)) {
-		vma = prev;
-		goto success;
+	vma = find_vma_prev(s->mm, s->addr, &prev);
+	if (vma && vma->vm_start <= s->addr) {
+		s->vma = vma;
+		return ESTK_DOWNGRADE;
 	}
 
-	if (vma && !vma_expand_down(vma, addr))
-		goto success;
+	if (prev && !vma_expand_up(prev, s->addr)) {
+		s->vma = prev;
+		return ESTK_DOWNGRADE;
+	}
 
-	mmap_write_unlock(mm);
+	if (vma && !vma_expand_down(vma, s->addr)) {
+		s->vma = vma;
+		return ESTK_DOWNGRADE;
+	}
+
+	mmap_write_unlock(s->mm);
+	s->locked = false;
+	return ESTK_DONE;
+}
+
+static struct vm_area_struct *estk_downgrade(struct rust_estk_state *s)
+{
+	mmap_write_downgrade(s->mm);
+	s->locked = false;
+	return s->vma;
+}
+
+static void estk_abort(struct rust_estk_state *s)
+{
+	if (s->locked)
+		mmap_write_unlock(s->mm);
+	s->locked = false;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_estk_classify(struct rust_estk_state *s)
+{
+	return estk_classify(s);
+}
+
+struct vm_area_struct *rust_estk_downgrade(struct rust_estk_state *s)
+{
+	return estk_downgrade(s);
+}
+
+void rust_estk_abort(struct rust_estk_state *s)
+{
+	estk_abort(s);
+}
+#endif
+
+static struct vm_area_struct *finish_estk(struct rust_estk_state *s)
+{
+	if (estk_classify(s) == ESTK_DOWNGRADE)
+		return estk_downgrade(s);
 	return NULL;
+}
 
-success:
-	mmap_write_downgrade(mm);
-	return vma;
+struct vm_area_struct *expand_stack(struct mm_struct *mm, unsigned long addr)
+{
+	struct rust_estk_state s = {
+		.mm = mm,
+		.addr = addr,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	struct vm_area_struct *rust_ret;
+
+	rust_ret = rust_estk_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_estk(&s);
 }
 
 /* do_munmap() - Wrapper function for non-maple tree aware do_munmap() calls.
