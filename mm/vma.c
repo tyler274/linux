@@ -886,21 +886,41 @@ static bool can_merge_remove_vma(struct vm_area_struct *vma)
  * - The caller must hold a WRITE lock on the mm_struct->mmap_lock.
  * - vmi must be positioned within [@vmg->middle->vm_start, @vmg->middle->vm_end).
  */
-static __must_check struct vm_area_struct *vma_merge_existing_range(
-		struct vma_merge_struct *vmg)
-{
-	vma_flags_t sticky_flags = vma_flags_and_mask(&vmg->vma_flags,
-						      VMA_STICKY_FLAGS);
-	struct vm_area_struct *middle = vmg->middle;
-	struct vm_area_struct *prev = vmg->prev;
+#define VEX_NONE		0
+#define VEX_BOTH		1
+#define VEX_LEFT		2
+#define VEX_RIGHT		3
+
+struct rust_vex_state {
+	struct vma_merge_struct *vmg;
+	vma_flags_t sticky_flags;
+	struct vm_area_struct *middle;
+	struct vm_area_struct *prev;
 	struct vm_area_struct *next;
-	struct vm_area_struct *anon_dup = NULL;
-	unsigned long start = vmg->start;
-	unsigned long end = vmg->end;
-	bool left_side = middle && start == middle->vm_start;
-	bool right_side = middle && end == middle->vm_end;
-	int err = 0;
+	struct vm_area_struct *anon_dup;
+	unsigned long start;
+};
+
+static int vex_classify(struct rust_vex_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+	struct vm_area_struct *middle;
+	struct vm_area_struct *prev;
+	struct vm_area_struct *next;
+	unsigned long start;
+	unsigned long end;
+	bool left_side, right_side;
 	bool merge_left, merge_right, merge_both;
+
+	s->anon_dup = NULL;
+	s->next = NULL;
+	middle = s->middle = vmg->middle;
+	prev = s->prev = vmg->prev;
+	start = s->start = vmg->start;
+	end = vmg->end;
+	s->sticky_flags = vma_flags_and_mask(&vmg->vma_flags, VMA_STICKY_FLAGS);
+	left_side = middle && start == middle->vm_start;
+	right_side = middle && end == middle->vm_end;
 
 	mmap_assert_write_locked(vmg->mm);
 	VM_WARN_ON_VMG(!middle, vmg); /* We are modifying a VMA, so caller must specify. */
@@ -931,7 +951,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 	 */
 	if (vma_flags_test_any_mask(&vmg->vma_flags, VMA_SPECIAL_FLAGS) ||
 	    (!left_side && !right_side))
-		return NULL;
+		return VEX_NONE;
 
 	if (left_side)
 		merge_left = can_vma_merge_left(vmg);
@@ -947,11 +967,12 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 		merge_right = false;
 		next = NULL;
 	}
+	s->next = next;
 
 	if (merge_left)		/* If merging prev, position iterator there. */
 		vma_prev(vmg->vmi);
 	else if (!merge_right)	/* If we have nothing to merge, abort. */
-		return NULL;
+		return VEX_NONE;
 
 	merge_both = merge_left && merge_right;
 	/* If we span the entire VMA, a merge implies it will be deleted. */
@@ -962,7 +983,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 	 * we have no sensible recourse but to abort the merge.
 	 */
 	if (vmg->__remove_middle && !can_merge_remove_vma(middle))
-		return NULL;
+		return VEX_NONE;
 
 	/*
 	 * If we merge both VMAs, then next is also deleted. This implies
@@ -989,7 +1010,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 		vma_start_write(next);
 		vmg->target = next;
 		next_sticky = vma_flags_and_mask(&next->flags, VMA_STICKY_FLAGS);
-		vma_flags_set_mask(&sticky_flags, next_sticky);
+		vma_flags_set_mask(&s->sticky_flags, next_sticky);
 	}
 
 	if (merge_left) {
@@ -999,88 +1020,121 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 		vmg->target = prev;
 
 		prev_sticky = vma_flags_and_mask(&prev->flags, VMA_STICKY_FLAGS);
-		vma_flags_set_mask(&sticky_flags, prev_sticky);
+		vma_flags_set_mask(&s->sticky_flags, prev_sticky);
 	}
 
-	if (merge_both) {
-		/*
-		 * |<-------------------->|
-		 * |-------********-------|
-		 *   prev   middle   next
-		 *  extend  delete  delete
-		 */
-		vmg->start = prev->vm_start;
+	if (merge_both)
+		return VEX_BOTH;
+	if (merge_left)
+		return VEX_LEFT;
+	return VEX_RIGHT;
+}
+
+static int vex_both(struct rust_vex_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+	struct vm_area_struct *prev = s->prev;
+	struct vm_area_struct *next = s->next;
+	struct vm_area_struct *middle = s->middle;
+
+	/*
+	 * |<-------------------->|
+	 * |-------********-------|
+	 *   prev   middle   next
+	 *  extend  delete  delete
+	 */
+	vmg->start = prev->vm_start;
+	vmg->end = next->vm_end;
+	vmg->pgoff = vma_start_pgoff(prev);
+	vmg->anon_pgoff = vma_start_anon_pgoff(prev);
+
+	/*
+	 * We already ensured anon_vma compatibility above, so now it's
+	 * simply a case of, if prev has no anon_vma object, which of
+	 * next or middle contains the anon_vma we must duplicate.
+	 */
+	return dup_anon_vma(prev, next->anon_vma ? next : middle, &s->anon_dup);
+}
+
+static int vex_left(struct rust_vex_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+	struct vm_area_struct *prev = s->prev;
+	struct vm_area_struct *middle = s->middle;
+
+	/*
+	 * |<------------>|      OR
+	 * |<----------------->|
+	 * |-------*************
+	 *   prev     middle
+	 *  extend shrink/delete
+	 */
+	vmg->start = prev->vm_start;
+	vmg->pgoff = vma_start_pgoff(prev);
+	vmg->anon_pgoff = vma_start_anon_pgoff(prev);
+
+	if (!vmg->__remove_middle)
+		vmg->__adjust_middle_start = true;
+
+	return dup_anon_vma(prev, middle, &s->anon_dup);
+}
+
+static int vex_right(struct rust_vex_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+	struct vm_area_struct *middle = s->middle;
+	struct vm_area_struct *prev = s->prev;
+	struct vm_area_struct *next = s->next;
+	const pgoff_t pglen = vmg_pages(vmg);
+
+	/*
+	 *     |<------------->| OR
+	 * |<----------------->|
+	 * *************-------|
+	 *    middle     next
+	 * shrink/delete extend
+	 */
+	VM_WARN_ON_VMG(vmg->start > middle->vm_start && prev && middle != prev, vmg);
+
+	if (vmg->__remove_middle) {
 		vmg->end = next->vm_end;
-		vmg->pgoff = vma_start_pgoff(prev);
-		vmg->anon_pgoff = vma_start_anon_pgoff(prev);
-
-		/*
-		 * We already ensured anon_vma compatibility above, so now it's
-		 * simply a case of, if prev has no anon_vma object, which of
-		 * next or middle contains the anon_vma we must duplicate.
-		 */
-		err = dup_anon_vma(prev, next->anon_vma ? next : middle,
-				   &anon_dup);
-	} else if (merge_left) {
-		/*
-		 * |<------------>|      OR
-		 * |<----------------->|
-		 * |-------*************
-		 *   prev     middle
-		 *  extend shrink/delete
-		 */
-		vmg->start = prev->vm_start;
-		vmg->pgoff = vma_start_pgoff(prev);
-		vmg->anon_pgoff = vma_start_anon_pgoff(prev);
-
-		if (!vmg->__remove_middle)
-			vmg->__adjust_middle_start = true;
-
-		err = dup_anon_vma(prev, middle, &anon_dup);
-	} else { /* merge_right */
-		/*
-		 *     |<------------->| OR
-		 * |<----------------->|
-		 * *************-------|
-		 *    middle     next
-		 * shrink/delete extend
-		 */
-		const pgoff_t pglen = vmg_pages(vmg);
-
-		VM_WARN_ON_VMG(!merge_right, vmg);
-		/* If we are offset into a VMA, then prev must be middle. */
-		VM_WARN_ON_VMG(vmg->start > middle->vm_start && prev && middle != prev, vmg);
-
-		if (vmg->__remove_middle) {
-			vmg->end = next->vm_end;
-			vmg->pgoff = vma_start_pgoff(next) - pglen;
-			vmg->anon_pgoff = vma_start_anon_pgoff(next) - pglen;
-		} else {
-			/* We shrink middle and expand next. */
-			vmg->__adjust_next_start = true;
-			vmg->start = middle->vm_start;
-			vmg->end = start;
-			vmg->pgoff = vma_start_pgoff(middle);
-			vmg->anon_pgoff = vma_start_anon_pgoff(middle);
-		}
-
-		err = dup_anon_vma(next, middle, &anon_dup);
+		vmg->pgoff = vma_start_pgoff(next) - pglen;
+		vmg->anon_pgoff = vma_start_anon_pgoff(next) - pglen;
+	} else {
+		/* We shrink middle and expand next. */
+		vmg->__adjust_next_start = true;
+		vmg->start = middle->vm_start;
+		vmg->end = s->start;
+		vmg->pgoff = vma_start_pgoff(middle);
+		vmg->anon_pgoff = vma_start_anon_pgoff(middle);
 	}
 
-	if (err || commit_merge(vmg))
-		goto abort;
+	return dup_anon_vma(next, middle, &s->anon_dup);
+}
 
-	vma_set_flags_mask(vmg->target, sticky_flags);
+static struct vm_area_struct *vex_commit(struct rust_vex_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+
+	if (commit_merge(vmg))
+		return NULL;
+
+	vma_set_flags_mask(vmg->target, s->sticky_flags);
 	khugepaged_enter_vma(vmg->target, vmg->vm_flags);
 	vmg->state = VMA_MERGE_SUCCESS;
 	return vmg->target;
+}
 
-abort:
-	vma_iter_set(vmg->vmi, start);
+static void vex_abort(struct rust_vex_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+
+	vma_iter_set(vmg->vmi, s->start);
 	vma_iter_load(vmg->vmi);
 
-	if (anon_dup)
-		unlink_anon_vmas(anon_dup);
+	if (s->anon_dup)
+		unlink_anon_vmas(s->anon_dup);
+	s->anon_dup = NULL;
 
 	/*
 	 * This means we have failed to clone anon_vma's correctly, but no
@@ -1090,7 +1144,80 @@ abort:
 	 */
 	if (!vmg->give_up_on_oom)
 		vmg->state = VMA_MERGE_ERROR_NOMEM;
-	return NULL;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vex_classify(struct rust_vex_state *s)
+{
+	return vex_classify(s);
+}
+
+int rust_vex_both(struct rust_vex_state *s)
+{
+	return vex_both(s);
+}
+
+int rust_vex_left(struct rust_vex_state *s)
+{
+	return vex_left(s);
+}
+
+int rust_vex_right(struct rust_vex_state *s)
+{
+	return vex_right(s);
+}
+
+struct vm_area_struct *rust_vex_commit(struct rust_vex_state *s)
+{
+	return vex_commit(s);
+}
+
+void rust_vex_abort(struct rust_vex_state *s)
+{
+	vex_abort(s);
+}
+#endif
+
+static struct vm_area_struct *finish_vex(struct rust_vex_state *s)
+{
+	int kind;
+	int err;
+
+	kind = vex_classify(s);
+	if (kind == VEX_NONE)
+		return NULL;
+	if (kind == VEX_BOTH)
+		err = vex_both(s);
+	else if (kind == VEX_LEFT)
+		err = vex_left(s);
+	else
+		err = vex_right(s);
+	if (err) {
+		vex_abort(s);
+		return NULL;
+	}
+	if (!vex_commit(s)) {
+		vex_abort(s);
+		return NULL;
+	}
+	return s->vmg->target;
+}
+
+static __must_check struct vm_area_struct *vma_merge_existing_range(
+		struct vma_merge_struct *vmg)
+{
+	struct rust_vex_state s = {
+		.vmg = vmg,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	struct vm_area_struct *rust_ret;
+
+	rust_ret = rust_vex_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vex(&s);
 }
 
 /*

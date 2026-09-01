@@ -4365,6 +4365,13 @@ unsigned long rust_sysbrk_dispatch(struct rust_sysbrk_state *s, int *handled);
 int rust_sysbrk_classify(struct rust_sysbrk_state *s, unsigned long *out);
 unsigned long rust_sysbrk_exit(struct rust_sysbrk_state *s);
 void rust_sysbrk_abort(struct rust_sysbrk_state *s);
+struct rust_vmbrk_state;
+#define RUST_VMBRK_DONE		0
+#define RUST_VMBRK_EXIT		1
+int rust_vmbrk_dispatch(struct rust_vmbrk_state *s, int *handled);
+int rust_vmbrk_classify(struct rust_vmbrk_state *s, int *out);
+int rust_vmbrk_exit(struct rust_vmbrk_state *s);
+void rust_vmbrk_abort(struct rust_vmbrk_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;
@@ -4442,6 +4449,18 @@ struct vm_area_struct *rust_vmerge_dispatch(struct vma_merge_struct *vmg,
 					    int *handled);
 int rust_vmerge_classify(struct vma_merge_struct *vmg);
 struct vm_area_struct *rust_vmerge_expand(struct vma_merge_struct *vmg);
+struct rust_vex_state;
+#define RUST_VEX_NONE		0
+#define RUST_VEX_BOTH		1
+#define RUST_VEX_LEFT		2
+#define RUST_VEX_RIGHT		3
+struct vm_area_struct *rust_vex_dispatch(struct rust_vex_state *s, int *handled);
+int rust_vex_classify(struct rust_vex_state *s);
+int rust_vex_both(struct rust_vex_state *s);
+int rust_vex_left(struct rust_vex_state *s);
+int rust_vex_right(struct rust_vex_state *s);
+struct vm_area_struct *rust_vex_commit(struct rust_vex_state *s);
+void rust_vex_abort(struct rust_vex_state *s);
 struct rust_mnva_state;
 #define RUST_MNVA_DONE		0
 #define RUST_MNVA_FILE		1

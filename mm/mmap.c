@@ -1430,48 +1430,134 @@ out:
 	return ret;
 }
 
-int vm_brk_flags(unsigned long addr, unsigned long request, bool is_exec)
-{
-	const vma_flags_t vma_flags = is_exec ?
-		mk_vma_flags(VMA_EXEC_BIT) : EMPTY_VMA_FLAGS;
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma = NULL;
+#define VMBRK_DONE		0
+#define VMBRK_EXIT		1
+
+struct rust_vmbrk_state {
+	unsigned long addr;
+	unsigned long request;
+	bool is_exec;
+	vma_flags_t vma_flags;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
 	unsigned long len;
 	int ret;
 	bool populate;
-	LIST_HEAD(uf);
-	VMA_ITERATOR(vmi, mm, addr);
+	bool locked;
+	struct vma_iterator vmi;
+	struct list_head uf;
+};
 
-	len = PAGE_ALIGN(request);
-	if (len < request)
-		return -ENOMEM;
-	if (!len)
-		return 0;
+static int vmbrk_classify(struct rust_vmbrk_state *s, int *out)
+{
+	int ret;
 
-	if (mmap_write_lock_killable(mm))
-		return -EINTR;
+	s->mm = current->mm;
+	s->vma = NULL;
+	s->populate = false;
+	s->locked = false;
+	s->ret = 0;
+	INIT_LIST_HEAD(&s->uf);
+	s->vma_flags = s->is_exec ?
+		mk_vma_flags(VMA_EXEC_BIT) : EMPTY_VMA_FLAGS;
+	*out = 0;
 
-	ret = check_brk_limits(addr, len);
+	s->len = PAGE_ALIGN(s->request);
+	if (s->len < s->request) {
+		*out = -ENOMEM;
+		return VMBRK_DONE;
+	}
+	if (!s->len)
+		return VMBRK_DONE;
+
+	if (mmap_write_lock_killable(s->mm)) {
+		*out = -EINTR;
+		return VMBRK_DONE;
+	}
+	s->locked = true;
+	vma_iter_init(&s->vmi, s->mm, s->addr);
+
+	ret = check_brk_limits(s->addr, s->len);
 	if (ret)
-		goto limits_failed;
+		goto fail;
 
-	ret = do_vmi_munmap(&vmi, mm, addr, len, &uf, 0);
+	ret = do_vmi_munmap(&s->vmi, s->mm, s->addr, s->len, &s->uf, 0);
 	if (ret)
-		goto munmap_failed;
+		goto fail;
 
-	vma = vma_prev(&vmi);
-	ret = do_brk_flags(&vmi, vma, addr, len, vma_flags);
-	populate = vma_flags_test(&mm->def_vma_flags, VMA_LOCKED_BIT);
-	mmap_write_unlock(mm);
-	userfaultfd_unmap_complete(mm, &uf);
-	if (populate && !ret)
-		mm_populate(addr, len);
-	return ret;
+	s->vma = vma_prev(&s->vmi);
+	s->ret = do_brk_flags(&s->vmi, s->vma, s->addr, s->len, s->vma_flags);
+	s->populate = vma_flags_test(&s->mm->def_vma_flags, VMA_LOCKED_BIT);
+	mmap_write_unlock(s->mm);
+	s->locked = false;
+	*out = s->ret;
+	return VMBRK_EXIT;
 
-munmap_failed:
-limits_failed:
-	mmap_write_unlock(mm);
-	return ret;
+fail:
+	mmap_write_unlock(s->mm);
+	s->locked = false;
+	*out = ret;
+	return VMBRK_DONE;
+}
+
+static int vmbrk_exit(struct rust_vmbrk_state *s)
+{
+	userfaultfd_unmap_complete(s->mm, &s->uf);
+	if (s->populate && !s->ret)
+		mm_populate(s->addr, s->len);
+	return s->ret;
+}
+
+static void vmbrk_abort(struct rust_vmbrk_state *s)
+{
+	if (s->locked) {
+		mmap_write_unlock(s->mm);
+		s->locked = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vmbrk_classify(struct rust_vmbrk_state *s, int *out)
+{
+	return vmbrk_classify(s, out);
+}
+
+int rust_vmbrk_exit(struct rust_vmbrk_state *s)
+{
+	return vmbrk_exit(s);
+}
+
+void rust_vmbrk_abort(struct rust_vmbrk_state *s)
+{
+	vmbrk_abort(s);
+}
+#endif
+
+static int finish_vmbrk(struct rust_vmbrk_state *s)
+{
+	int out = 0;
+
+	if (vmbrk_classify(s, &out) == VMBRK_EXIT)
+		return vmbrk_exit(s);
+	return out;
+}
+
+int vm_brk_flags(unsigned long addr, unsigned long request, bool is_exec)
+{
+	struct rust_vmbrk_state s = {
+		.addr = addr,
+		.request = request,
+		.is_exec = is_exec,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_vmbrk_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vmbrk(&s);
 }
 
 static

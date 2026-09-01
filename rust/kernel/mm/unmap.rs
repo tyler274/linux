@@ -22,8 +22,10 @@
 //! `madvise_dontneed_free` (validate vs zap vs `MADV_FREE`), and
 //! `madvise_update_vma` (no-op vs name vs flags), `vma_merge_new_range`
 //! (no-merge vs expand), `__mmap_new_vma` (file vs shmem vs store),
-//! `brk` (shrink vs expand vs unlock/populate), and `process_madvise`
-//! (pidfd/iovec vs vector walk).
+//! `brk` (shrink vs expand vs unlock/populate), `process_madvise`
+//! (pidfd/iovec vs vector walk), `vm_brk_flags` (lock/limits vs munmap
+//! vs do_brk vs populate), and `vma_merge_existing_range` (no-merge vs
+//! both/left/right).
 //! Maple-tree expand/store and the merge / new-VMA file mmap/shmem /
 //! `change_protection` / page-table move / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
@@ -78,6 +80,20 @@ const SYSBRK_EXIT: i32 = 1;
 const PMAD_DONE: i32 = 0;
 /// pidfd and iovec acquired; run `vector_madvise` then release.
 const PMAD_APPLY: i32 = 1;
+
+/// Matches `RUST_VMBRK_*` in `include/linux/mm.h`.
+const VMBRK_DONE: i32 = 0;
+/// Unlocked; uffd complete and maybe populate.
+const VMBRK_EXIT: i32 = 1;
+
+/// Matches `RUST_VEX_*` in `include/linux/mm.h`.
+const VEX_NONE: i32 = 0;
+/// Merge prev and next around middle.
+const VEX_BOTH: i32 = 1;
+/// Merge prev into middle.
+const VEX_LEFT: i32 = 2;
+/// Merge next into middle.
+const VEX_RIGHT: i32 = 3;
 
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
@@ -222,11 +238,13 @@ static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
 static N_SYSBRK: Atomic<u32> = Atomic::new(0);
+static N_VMBRK: Atomic<u32> = Atomic::new(0);
 static N_MPROTECT: Atomic<u32> = Atomic::new(0);
 static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
 static N_MMAPREG: Atomic<u32> = Atomic::new(0);
 static N_VMERGE: Atomic<u32> = Atomic::new(0);
+static N_VEX: Atomic<u32> = Atomic::new(0);
 static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
 #[cfg(CONFIG_64BIT)]
@@ -434,7 +452,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1879,4 +1897,113 @@ pub unsafe extern "C" fn rust_pmad_dispatch(
             EINVAL.to_errno() as isize
         }
     }
+}
+
+/// C ABI: sequence `vm_brk_flags` after C takes the mmap lock.
+///
+/// Sets `*handled` once classify has run. Limits/munmap failures
+/// unlock without uffd. Success unlocks, then uffd and maybe populate.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vmbrk_state` with addr/request/is_exec
+/// filled. `handled` must be a valid out-parameter. No mmap lock is
+/// held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vmbrk_dispatch(
+    s: *mut bindings::rust_vmbrk_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify takes the mmap write lock.
+    let kind = unsafe { bindings::rust_vmbrk_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VMBRK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vm_brk sequenced\n");
+    }
+
+    match kind {
+        VMBRK_DONE => out,
+        // SAFETY: Unlocked; complete uffd and maybe populate.
+        VMBRK_EXIT => unsafe { bindings::rust_vmbrk_exit(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vm_brk kind {kind}\n");
+            // SAFETY: Drop a leftover write lock.
+            unsafe { bindings::rust_vmbrk_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `vma_merge_existing_range` after C classifies adjacency.
+///
+/// Sets `*handled` once classify has run. `dup_anon_vma` and
+/// `commit_merge` stay in C. Unknown kind or a failed dup/commit aborts
+/// the iterator and unlinks a partial anon_vma clone.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vex_state` with `vmg` filled. mmap write
+/// lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vex_dispatch(
+    s: *mut bindings::rust_vex_state,
+    handled: *mut c_int,
+) -> *mut bindings::vm_area_struct {
+    if s.is_null() || handled.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: `s` is live; classify may take VMA write locks.
+    let kind = unsafe { bindings::rust_vex_classify(s) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VEX.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_merge_existing sequenced\n");
+    }
+
+    if kind == VEX_NONE {
+        return ptr::null_mut();
+    }
+
+    let err = match kind {
+        // SAFETY: Merge prev+next; dup_anon_vma stays in C.
+        VEX_BOTH => unsafe { bindings::rust_vex_both(s) },
+        // SAFETY: Merge prev; dup_anon_vma stays in C.
+        VEX_LEFT => unsafe { bindings::rust_vex_left(s) },
+        // SAFETY: Merge next; dup_anon_vma stays in C.
+        VEX_RIGHT => unsafe { bindings::rust_vex_right(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vma_merge_existing kind {kind}\n");
+            // SAFETY: Classify already locked VMAs; reset the iterator.
+            unsafe { bindings::rust_vex_abort(s) };
+            return ptr::null_mut();
+        }
+    };
+    if err != 0 {
+        // SAFETY: dup_anon_vma failed; unlink and reset the iterator.
+        unsafe { bindings::rust_vex_abort(s) };
+        return ptr::null_mut();
+    }
+    // SAFETY: Anon vmas cloned; maple-tree commit stays in C.
+    let committed = unsafe { bindings::rust_vex_commit(s) };
+    if committed.is_null() {
+        // SAFETY: commit_merge failed; reset the iterator.
+        unsafe { bindings::rust_vex_abort(s) };
+        return ptr::null_mut();
+    }
+    committed
 }
