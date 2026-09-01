@@ -221,7 +221,9 @@ config RUST_MMAP
 	  mprotect VMA walk (lock/pkey/grows vs per-VMA fixup), munlock,
 	  mlockall, munlockall, msync (validate vs VMA walk), mincore
 	  (validate vs residency walk), and process_madvise's vector
-	  walk (lock vs per-iov). Maple-tree VMA storage and the
+	  walk (lock vs per-iov), madvise_do_behavior (poison vs
+	  populate vs VMA walk), and madvise_walk_vmas (single-VMA
+	  readlock vs iter). Maple-tree VMA storage and the
 	  merge/new-VMA bodies stay in C.
 
 	  If unsure, say N.

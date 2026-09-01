@@ -1659,8 +1659,27 @@ take_mmap_read_lock:
  * existing vmas in the range.  Must be called with the mmap_lock held for
  * reading or writing.
  */
-static
-int madvise_walk_vmas(struct madvise_behavior *madv_behavior)
+#define MWALK_DONE		0
+#define MWALK_ITER		1
+
+static int mwalk_start(struct madvise_behavior *madv_behavior, int *out)
+{
+	*out = 0;
+	/*
+	 * If VMA read lock is supported, apply madvise to a single VMA
+	 * tentatively, avoiding walking VMAs.
+	 */
+	if (madv_behavior->lock_mode == MADVISE_VMA_READ_LOCK &&
+	    try_vma_read_lock(madv_behavior)) {
+		*out = madvise_vma_behavior(madv_behavior);
+		vma_end_read(madv_behavior->vma);
+		return MWALK_DONE;
+	}
+
+	return MWALK_ITER;
+}
+
+static int mwalk_iter(struct madvise_behavior *madv_behavior)
 {
 	struct mm_struct *mm = madv_behavior->mm;
 	struct madvise_behavior_range *range = &madv_behavior->range;
@@ -1669,17 +1688,6 @@ int madvise_walk_vmas(struct madvise_behavior *madv_behavior)
 	int unmapped_error = 0;
 	int error;
 	struct vm_area_struct *prev, *vma;
-
-	/*
-	 * If VMA read lock is supported, apply madvise to a single VMA
-	 * tentatively, avoiding walking VMAs.
-	 */
-	if (madv_behavior->lock_mode == MADVISE_VMA_READ_LOCK &&
-	    try_vma_read_lock(madv_behavior)) {
-		error = madvise_vma_behavior(madv_behavior);
-		vma_end_read(madv_behavior->vma);
-		return error;
-	}
 
 	vma = find_vma_prev(mm, range->start, &prev);
 	if (vma && range->start > vma->vm_start)
@@ -1733,6 +1741,43 @@ int madvise_walk_vmas(struct madvise_behavior *madv_behavior)
 	}
 
 	return unmapped_error;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mwalk_start(struct madvise_behavior *m, int *out)
+{
+	return mwalk_start(m, out);
+}
+
+int rust_mwalk_iter(struct madvise_behavior *m)
+{
+	return mwalk_iter(m);
+}
+#endif
+
+static int finish_mwalk(struct madvise_behavior *madv_behavior)
+{
+	int out = 0;
+	int kind;
+
+	kind = mwalk_start(madv_behavior, &out);
+	if (kind == MWALK_DONE)
+		return out;
+	return mwalk_iter(madv_behavior);
+}
+
+static
+int madvise_walk_vmas(struct madvise_behavior *madv_behavior)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mwalk_dispatch(madv_behavior, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mwalk(madv_behavior);
 }
 
 /*
@@ -1885,29 +1930,96 @@ static inline unsigned long get_untagged_addr(struct mm_struct *mm,
 				   untagged_addr_remote(mm, start);
 }
 
-static int madvise_do_behavior(unsigned long start, size_t len_in,
-		struct madvise_behavior *madv_behavior)
+#define MDO_DONE		0
+#define MDO_POPULATE		1
+#define MDO_WALK		2
+
+static int mdo_classify(unsigned long start, size_t len_in,
+			struct madvise_behavior *madv_behavior, int *out)
 {
-	struct blk_plug plug;
-	int error;
 	struct madvise_behavior_range *range = &madv_behavior->range;
 
+	*out = 0;
 	if (is_memory_failure(madv_behavior)) {
 		range->start = start;
 		range->end = start + len_in;
-		return madvise_inject_error(madv_behavior);
+		*out = madvise_inject_error(madv_behavior);
+		return MDO_DONE;
 	}
 
 	range->start = get_untagged_addr(madv_behavior->mm, start);
 	range->end = range->start + PAGE_ALIGN(len_in);
+	if (is_madvise_populate(madv_behavior))
+		return MDO_POPULATE;
+	return MDO_WALK;
+}
+
+static int mdo_populate(struct madvise_behavior *madv_behavior)
+{
+	struct blk_plug plug;
+	int error;
 
 	blk_start_plug(&plug);
-	if (is_madvise_populate(madv_behavior))
-		error = madvise_populate(madv_behavior);
-	else
-		error = madvise_walk_vmas(madv_behavior);
+	error = madvise_populate(madv_behavior);
 	blk_finish_plug(&plug);
 	return error;
+}
+
+static int mdo_walk(struct madvise_behavior *madv_behavior)
+{
+	struct blk_plug plug;
+	int error;
+
+	blk_start_plug(&plug);
+	error = madvise_walk_vmas(madv_behavior);
+	blk_finish_plug(&plug);
+	return error;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mdo_classify(unsigned long start, size_t len_in,
+		      struct madvise_behavior *m, int *out)
+{
+	return mdo_classify(start, len_in, m, out);
+}
+
+int rust_mdo_populate(struct madvise_behavior *m)
+{
+	return mdo_populate(m);
+}
+
+int rust_mdo_walk(struct madvise_behavior *m)
+{
+	return mdo_walk(m);
+}
+#endif
+
+static int finish_mdo(unsigned long start, size_t len_in,
+		      struct madvise_behavior *madv_behavior)
+{
+	int out = 0;
+	int kind;
+
+	kind = mdo_classify(start, len_in, madv_behavior, &out);
+	if (kind == MDO_DONE)
+		return out;
+	if (kind == MDO_POPULATE)
+		return mdo_populate(madv_behavior);
+	return mdo_walk(madv_behavior);
+}
+
+static int madvise_do_behavior(unsigned long start, size_t len_in,
+		struct madvise_behavior *madv_behavior)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mdo_dispatch(start, len_in, madv_behavior, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mdo(start, len_in, madv_behavior);
 }
 
 /*

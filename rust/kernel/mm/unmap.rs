@@ -14,10 +14,12 @@
 //! populate), `mlock_fixup` (filter vs `vma_modify_flags` vs pages),
 //! mprotect VMA walk (lock/pkey/grows vs per-VMA `mprotect_fixup`),
 //! `munlock`, `mlockall`, and `munlockall`, `msync` (validate vs VMA
-//! walk), `mincore` (validate vs residency walk), and
-//! `vector_madvise` (lock vs per-iov walk).
+//! walk), `mincore` (validate vs residency walk),
+//! `vector_madvise` (lock vs per-iov walk), `madvise_do_behavior`
+//! (poison vs populate vs VMA walk), and `madvise_walk_vmas`
+//! (single-VMA readlock vs iter).
 //! Maple-tree storage and the merge / new-VMA / `change_protection` /
-//! page-table move / madvise VMA-walk / seal-range / mlock page-walk /
+//! page-table move / madvise per-VMA / seal-range / mlock page-walk /
 //! msync / mincore walk bodies stay in C. The mmap lock is already
 //! held by the C caller except for mprotect, mremap, madvise, mseal,
 //! mlock, munlock, mlockall, munlockall, msync, mincore, and
@@ -153,6 +155,18 @@ const VMADV_DONE: i32 = 0;
 /// mmap lock taken; walk each iovec then unlock.
 const VMADV_WALK: i32 = 1;
 
+/// Matches `RUST_MDO_*` in `include/linux/mm.h`.
+const MDO_DONE: i32 = 0;
+/// Prefault via `madvise_populate`.
+const MDO_POPULATE: i32 = 1;
+/// Walk VMAs via `madvise_walk_vmas`.
+const MDO_WALK: i32 = 2;
+
+/// Matches `RUST_MWALK_*` in `include/linux/mm.h`.
+const MWALK_DONE: i32 = 0;
+/// Need the multi-VMA iterator.
+const MWALK_ITER: i32 = 1;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
@@ -172,6 +186,8 @@ static N_MUNLOCKALL: Atomic<u32> = Atomic::new(0);
 static N_MSYNC: Atomic<u32> = Atomic::new(0);
 static N_MINCORE: Atomic<u32> = Atomic::new(0);
 static N_VMADV: Atomic<u32> = Atomic::new(0);
+static N_MDO: Atomic<u32> = Atomic::new(0);
+static N_MWALK: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -360,7 +376,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1393,4 +1409,94 @@ pub unsafe extern "C" fn rust_vmadvise_dispatch(
 
     // SAFETY: Lock held and tlb initialized; walk iovecs then unlock.
     unsafe { bindings::rust_vmadvise_walk(s) }
+}
+
+/// C ABI: sequence `madvise_do_behavior` after C classifies the hint.
+///
+/// Sets `*handled` once classify has run. Hardware-poison returns
+/// immediately. Populate and VMA-walk stay in C (with `blk_plug`).
+///
+/// # Safety
+///
+/// `m` must be the live `madvise_behavior` from `madvise_apply` or
+/// `vector_madvise`. `handled` must be a valid out-parameter. The
+/// madvise mmap lock is already held as for `madvise_do_behavior`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mdo_dispatch(
+    start: c_ulong,
+    len_in: usize,
+    m: *mut bindings::madvise_behavior,
+    handled: *mut c_int,
+) -> c_int {
+    if m.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `m` is live; classify may run inject_error for poison.
+    let kind = unsafe { bindings::rust_mdo_classify(start, len_in, m, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MDO.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first madvise_do sequenced\n");
+    }
+
+    match kind {
+        MDO_DONE => out,
+        // SAFETY: Prefault hint; populate under the existing lock.
+        MDO_POPULATE => unsafe { bindings::rust_mdo_populate(m) },
+        // SAFETY: Range set; walk VMAs (may nest `rust_mwalk_dispatch`).
+        MDO_WALK => unsafe { bindings::rust_mdo_walk(m) },
+        _ => {
+            pr_err!("rust-mmap: unknown madvise_do kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `madvise_walk_vmas` after C tries a single-VMA lock.
+///
+/// Sets `*handled` once start has run. The single-VMA readlock path
+/// returns without iterating. Per-VMA `madvise_vma_behavior` stays in
+/// C.
+///
+/// # Safety
+///
+/// `m` must be live with `range` filled. `handled` must be a valid
+/// out-parameter. mmap lock held as for `madvise_walk_vmas`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mwalk_dispatch(
+    m: *mut bindings::madvise_behavior,
+    handled: *mut c_int,
+) -> c_int {
+    if m.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `m` is live; may take a per-VMA read lock.
+    let kind = unsafe { bindings::rust_mwalk_start(m, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MWALK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first madvise_walk sequenced\n");
+    }
+
+    match kind {
+        MWALK_DONE => out,
+        // SAFETY: Need the multi-VMA iterator; find_vma stays in C.
+        MWALK_ITER => unsafe { bindings::rust_mwalk_iter(m) },
+        _ => {
+            pr_err!("rust-mmap: unknown madvise_walk kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
 }

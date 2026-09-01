@@ -4516,6 +4516,21 @@ ssize_t rust_vmadvise_dispatch(struct rust_vmadvise_state *s, int *handled);
 int rust_vmadvise_lock(struct rust_vmadvise_state *s, int *out);
 ssize_t rust_vmadvise_walk(struct rust_vmadvise_state *s);
 void rust_vmadvise_abort(struct rust_vmadvise_state *s);
+struct madvise_behavior;
+#define RUST_MDO_DONE		0
+#define RUST_MDO_POPULATE	1
+#define RUST_MDO_WALK		2
+int rust_mdo_dispatch(unsigned long start, size_t len_in,
+		      struct madvise_behavior *m, int *handled);
+int rust_mdo_classify(unsigned long start, size_t len_in,
+		      struct madvise_behavior *m, int *out);
+int rust_mdo_populate(struct madvise_behavior *m);
+int rust_mdo_walk(struct madvise_behavior *m);
+#define RUST_MWALK_DONE		0
+#define RUST_MWALK_ITER		1
+int rust_mwalk_dispatch(struct madvise_behavior *m, int *handled);
+int rust_mwalk_start(struct madvise_behavior *m, int *out);
+int rust_mwalk_iter(struct madvise_behavior *m);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0
