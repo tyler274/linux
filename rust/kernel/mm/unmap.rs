@@ -16,10 +16,13 @@
 //! `munlock`, `mlockall`, and `munlockall`, `msync` (validate vs VMA
 //! walk), `mincore` (validate vs residency walk),
 //! `vector_madvise` (lock vs per-iov walk), `madvise_do_behavior`
-//! (poison vs populate vs VMA walk), and `madvise_walk_vmas`
-//! (single-VMA readlock vs iter).
+//! (poison vs populate vs VMA walk), `madvise_walk_vmas`
+//! (single-VMA readlock vs iter), `madvise_vma_behavior`
+//! (direct action vs ENOMEM convert vs `madvise_update_vma`), and
+//! `madvise_dontneed_free` (validate vs zap vs `MADV_FREE`), and
+//! `madvise_update_vma` (no-op vs name vs flags).
 //! Maple-tree storage and the merge / new-VMA / `change_protection` /
-//! page-table move / madvise per-VMA / seal-range / mlock page-walk /
+//! page-table move / madvise per-hint / seal-range / mlock page-walk /
 //! msync / mincore walk bodies stay in C. The mmap lock is already
 //! held by the C caller except for mprotect, mremap, madvise, mseal,
 //! mlock, munlock, mlockall, munlockall, msync, mincore, and
@@ -167,6 +170,27 @@ const MWALK_DONE: i32 = 0;
 /// Need the multi-VMA iterator.
 const MWALK_ITER: i32 = 1;
 
+/// Matches `RUST_MVMA_*` in `include/linux/mm.h`.
+const MVMA_DIRECT: i32 = 0;
+/// Helper error; convert `-ENOMEM` to `-EAGAIN` and skip `madvise_update_vma`.
+const MVMA_CONVERT: i32 = 1;
+/// Flag change; `madvise_update_vma` then convert.
+const MVMA_UPDATE: i32 = 2;
+
+/// Matches `RUST_MDNF_*` in `include/linux/mm.h`.
+const MDNF_DONE: i32 = 0;
+/// Zap via `madvise_dontneed_single_vma`.
+const MDNF_DONTNEED: i32 = 1;
+/// Lazy free via `madvise_free_single_vma`.
+const MDNF_FREE: i32 = 2;
+
+/// Matches `RUST_MUPD_*` in `include/linux/mm.h`.
+const MUPD_DONE: i32 = 0;
+/// Split/merge via `vma_modify_name` then set the anon name.
+const MUPD_NAME: i32 = 1;
+/// Split/merge via `vma_modify_flags`.
+const MUPD_FLAGS: i32 = 2;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
@@ -188,6 +212,9 @@ static N_MINCORE: Atomic<u32> = Atomic::new(0);
 static N_VMADV: Atomic<u32> = Atomic::new(0);
 static N_MDO: Atomic<u32> = Atomic::new(0);
 static N_MWALK: Atomic<u32> = Atomic::new(0);
+static N_MVMA: Atomic<u32> = Atomic::new(0);
+static N_MDNF: Atomic<u32> = Atomic::new(0);
+static N_MUPD: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -376,7 +403,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1461,8 +1488,8 @@ pub unsafe extern "C" fn rust_mdo_dispatch(
 /// C ABI: sequence `madvise_walk_vmas` after C tries a single-VMA lock.
 ///
 /// Sets `*handled` once start has run. The single-VMA readlock path
-/// returns without iterating. Per-VMA `madvise_vma_behavior` stays in
-/// C.
+/// returns without iterating. Per-VMA `madvise_vma_behavior` is
+/// sequenced separately.
 ///
 /// # Safety
 ///
@@ -1496,6 +1523,143 @@ pub unsafe extern "C" fn rust_mwalk_dispatch(
         MWALK_ITER => unsafe { bindings::rust_mwalk_iter(m) },
         _ => {
             pr_err!("rust-mmap: unknown madvise_walk kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `madvise_vma_behavior` after C classifies the hint.
+///
+/// Sets `*handled` once classify has run. Direct helpers (`DONTNEED`,
+/// `REMOVE`, ...) return as-is. KSM/THP errors convert `-ENOMEM` to
+/// `-EAGAIN` without updating the VMA. Flag-update hints call
+/// `madvise_update_vma` in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_mvma_state` with `m` filled. `handled`
+/// must be a valid out-parameter. mmap lock held as for
+/// `madvise_vma_behavior`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mvma_dispatch(
+    s: *mut bindings::rust_mvma_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may call per-hint helpers.
+    let kind = unsafe { bindings::rust_mvma_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MVMA.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first madvise_vma sequenced\n");
+    }
+
+    match kind {
+        MVMA_DIRECT => out,
+        // SAFETY: Helper failed; convert ENOMEM without updating flags.
+        MVMA_CONVERT => unsafe { bindings::rust_mvma_convert(out) },
+        // SAFETY: Flags updated in classify; split/merge stays in C.
+        MVMA_UPDATE => unsafe { bindings::rust_mvma_update(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown madvise_vma kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `madvise_dontneed_free` after C validates the VMA.
+///
+/// Sets `*handled` once classify has run (including the optional
+/// userfaultfd lock drop and re-lookup). Zap and lazy-free stay in C.
+///
+/// # Safety
+///
+/// `m` must be the live `madvise_behavior` from `madvise_vma_behavior`.
+/// `handled` must be a valid out-parameter. mmap lock held as for
+/// `madvise_dontneed_free`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mdnf_dispatch(
+    m: *mut bindings::madvise_behavior,
+    handled: *mut c_int,
+) -> c_long {
+    if m.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_long;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_long = 0;
+    // SAFETY: `m` is live; classify may drop and retake the mmap lock.
+    let kind = unsafe { bindings::rust_mdnf_classify(m, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MDNF.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first madvise_dontneed sequenced\n");
+    }
+
+    match kind {
+        MDNF_DONE => out,
+        // SAFETY: Discard pages; zap stays in C.
+        MDNF_DONTNEED => unsafe { bindings::rust_mdnf_dontneed(m) },
+        // SAFETY: Lazy free; page walk stays in C.
+        MDNF_FREE => unsafe { bindings::rust_mdnf_free(m) },
+        _ => {
+            pr_err!("rust-mmap: unknown madvise_dontneed kind {kind}\n");
+            EINVAL.to_errno() as c_long
+        }
+    }
+}
+
+/// C ABI: sequence `madvise_update_vma` after C compares flags/name.
+///
+/// Sets `*handled` once classify has run. Maple-tree split/merge via
+/// `vma_modify_name` / `vma_modify_flags` stays in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_mupd_state` with `m` and `new_flags`
+/// filled. `handled` must be a valid out-parameter. mmap write lock
+/// held as for `madvise_update_vma`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mupd_dispatch(
+    s: *mut bindings::rust_mupd_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify only compares flags and name.
+    let kind = unsafe { bindings::rust_mupd_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MUPD.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first madvise_update sequenced\n");
+    }
+
+    match kind {
+        MUPD_DONE => out,
+        // SAFETY: Anon name change; vma_modify_name stays in C.
+        MUPD_NAME => unsafe { bindings::rust_mupd_name(s) },
+        // SAFETY: Flag change; vma_modify_flags stays in C.
+        MUPD_FLAGS => unsafe { bindings::rust_mupd_flags(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown madvise_update kind {kind}\n");
             EINVAL.to_errno()
         }
     }

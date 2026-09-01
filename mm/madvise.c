@@ -148,40 +148,117 @@ static int replace_anon_vma_name(struct vm_area_struct *vma,
  * Update the vm_flags or anon_name on region of a vma, splitting it or merging
  * it as necessary. Must be called with mmap_lock held for writing.
  */
-static int madvise_update_vma(vm_flags_t new_flags,
-		struct madvise_behavior *madv_behavior)
+#define MUPD_DONE		0
+#define MUPD_NAME		1
+#define MUPD_FLAGS		2
+
+struct rust_mupd_state {
+	struct madvise_behavior *m;
+	vm_flags_t new_flags;
+	vma_flags_t new_vma_flags;
+	bool set_new_anon_name;
+};
+
+static int mupd_classify(struct rust_mupd_state *s, int *out)
 {
-	struct vm_area_struct *vma = madv_behavior->vma;
-	vma_flags_t new_vma_flags = legacy_to_vma_flags(new_flags);
-	struct madvise_behavior_range *range = &madv_behavior->range;
-	struct anon_vma_name *anon_name = madv_behavior->anon_name;
-	bool set_new_anon_name = madv_behavior->behavior == __MADV_SET_ANON_VMA_NAME;
-	VMA_ITERATOR(vmi, madv_behavior->mm, range->start);
+	struct vm_area_struct *vma = s->m->vma;
+	struct anon_vma_name *anon_name = s->m->anon_name;
 
-	if (vma_flags_same_mask(&vma->flags, new_vma_flags) &&
-	    (!set_new_anon_name ||
+	*out = 0;
+	s->new_vma_flags = legacy_to_vma_flags(s->new_flags);
+	s->set_new_anon_name = s->m->behavior == __MADV_SET_ANON_VMA_NAME;
+
+	if (vma_flags_same_mask(&vma->flags, s->new_vma_flags) &&
+	    (!s->set_new_anon_name ||
 	     anon_vma_name_eq(anon_vma_name(vma), anon_name)))
-		return 0;
+		return MUPD_DONE;
 
-	if (set_new_anon_name)
-		vma = vma_modify_name(&vmi, madv_behavior->prev, vma,
-			range->start, range->end, anon_name);
-	else
-		vma = vma_modify_flags(&vmi, madv_behavior->prev, vma,
-			range->start, range->end, &new_vma_flags);
+	if (s->set_new_anon_name)
+		return MUPD_NAME;
+	return MUPD_FLAGS;
+}
 
+static int mupd_name(struct rust_mupd_state *s)
+{
+	struct vm_area_struct *vma;
+	struct madvise_behavior_range *range = &s->m->range;
+	VMA_ITERATOR(vmi, s->m->mm, range->start);
+
+	vma = vma_modify_name(&vmi, s->m->prev, s->m->vma,
+			      range->start, range->end, s->m->anon_name);
 	if (IS_ERR(vma))
 		return PTR_ERR(vma);
 
-	madv_behavior->vma = vma;
+	s->m->vma = vma;
+	vma_start_write(vma);
+	vma->flags = s->new_vma_flags;
+	return replace_anon_vma_name(vma, s->m->anon_name);
+}
 
+static int mupd_flags(struct rust_mupd_state *s)
+{
+	struct vm_area_struct *vma;
+	struct madvise_behavior_range *range = &s->m->range;
+	VMA_ITERATOR(vmi, s->m->mm, range->start);
+
+	vma = vma_modify_flags(&vmi, s->m->prev, s->m->vma,
+			       range->start, range->end, &s->new_vma_flags);
+	if (IS_ERR(vma))
+		return PTR_ERR(vma);
+
+	s->m->vma = vma;
 	/* vm_flags is protected by the mmap_lock held in write mode. */
 	vma_start_write(vma);
-	vma->flags = new_vma_flags;
-	if (set_new_anon_name)
-		return replace_anon_vma_name(vma, anon_name);
-
+	vma->flags = s->new_vma_flags;
 	return 0;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mupd_classify(struct rust_mupd_state *s, int *out)
+{
+	return mupd_classify(s, out);
+}
+
+int rust_mupd_name(struct rust_mupd_state *s)
+{
+	return mupd_name(s);
+}
+
+int rust_mupd_flags(struct rust_mupd_state *s)
+{
+	return mupd_flags(s);
+}
+#endif
+
+static int finish_mupd(struct rust_mupd_state *s)
+{
+	int out = 0;
+	int kind;
+
+	kind = mupd_classify(s, &out);
+	if (kind == MUPD_NAME)
+		return mupd_name(s);
+	if (kind == MUPD_FLAGS)
+		return mupd_flags(s);
+	return out;
+}
+
+static int madvise_update_vma(vm_flags_t new_flags,
+		struct madvise_behavior *madv_behavior)
+{
+	struct rust_mupd_state s = {
+		.m = madv_behavior,
+		.new_flags = new_flags,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mupd_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mupd(&s);
 }
 
 #ifdef CONFIG_SWAP
@@ -894,32 +971,42 @@ bool madvise_dontneed_free_valid_vma(struct madvise_behavior *madv_behavior)
 	return true;
 }
 
-static long madvise_dontneed_free(struct madvise_behavior *madv_behavior)
-{
-	struct mm_struct *mm = madv_behavior->mm;
-	struct madvise_behavior_range *range = &madv_behavior->range;
-	int behavior = madv_behavior->behavior;
+#define MDNF_DONE		0
+#define MDNF_DONTNEED		1
+#define MDNF_FREE		2
 
-	if (!madvise_dontneed_free_valid_vma(madv_behavior))
-		return -EINVAL;
+static int mdnf_classify(struct madvise_behavior *m, long *out)
+{
+	struct mm_struct *mm = m->mm;
+	struct madvise_behavior_range *range = &m->range;
+	int behavior = m->behavior;
+	struct vm_area_struct *vma;
+
+	*out = 0;
+	if (!madvise_dontneed_free_valid_vma(m)) {
+		*out = -EINVAL;
+		return MDNF_DONE;
+	}
 
 	if (range->start == range->end)
-		return 0;
+		return MDNF_DONE;
 
-	if (!userfaultfd_remove(madv_behavior->vma, range->start, range->end)) {
-		struct vm_area_struct *vma;
-
-		mark_mmap_lock_dropped(madv_behavior);
+	if (!userfaultfd_remove(m->vma, range->start, range->end)) {
+		mark_mmap_lock_dropped(m);
 		mmap_read_lock(mm);
-		madv_behavior->vma = vma = vma_lookup(mm, range->start);
-		if (!vma)
-			return -ENOMEM;
+		m->vma = vma = vma_lookup(mm, range->start);
+		if (!vma) {
+			*out = -ENOMEM;
+			return MDNF_DONE;
+		}
 		/*
 		 * Potential end adjustment for hugetlb vma is OK as
 		 * the check below keeps end within vma.
 		 */
-		if (!madvise_dontneed_free_valid_vma(madv_behavior))
-			return -EINVAL;
+		if (!madvise_dontneed_free_valid_vma(m)) {
+			*out = -EINVAL;
+			return MDNF_DONE;
+		}
 		if (range->end > vma->vm_end) {
 			/*
 			 * Don't fail if end > vma->vm_end. If the old
@@ -943,16 +1030,69 @@ static long madvise_dontneed_free(struct madvise_behavior *madv_behavior)
 		 * end down to the start address.
 		 */
 		if (range->start == range->end)
-			return 0;
+			return MDNF_DONE;
 		VM_WARN_ON(range->start > range->end);
 	}
 
 	if (behavior == MADV_DONTNEED || behavior == MADV_DONTNEED_LOCKED)
-		return madvise_dontneed_single_vma(madv_behavior);
-	else if (behavior == MADV_FREE)
-		return madvise_free_single_vma(madv_behavior);
-	else
-		return -EINVAL;
+		return MDNF_DONTNEED;
+	if (behavior == MADV_FREE)
+		return MDNF_FREE;
+	*out = -EINVAL;
+	return MDNF_DONE;
+}
+
+static long mdnf_dontneed(struct madvise_behavior *m)
+{
+	return madvise_dontneed_single_vma(m);
+}
+
+static long mdnf_free(struct madvise_behavior *m)
+{
+	return madvise_free_single_vma(m);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mdnf_classify(struct madvise_behavior *m, long *out)
+{
+	return mdnf_classify(m, out);
+}
+
+long rust_mdnf_dontneed(struct madvise_behavior *m)
+{
+	return mdnf_dontneed(m);
+}
+
+long rust_mdnf_free(struct madvise_behavior *m)
+{
+	return mdnf_free(m);
+}
+#endif
+
+static long finish_mdnf(struct madvise_behavior *m)
+{
+	long out = 0;
+	int kind;
+
+	kind = mdnf_classify(m, &out);
+	if (kind == MDNF_DONTNEED)
+		return mdnf_dontneed(m);
+	if (kind == MDNF_FREE)
+		return mdnf_free(m);
+	return out;
+}
+
+static long madvise_dontneed_free(struct madvise_behavior *madv_behavior)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	long rust_ret;
+
+	rust_ret = rust_mdnf_dispatch(madv_behavior, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mdnf(madv_behavior);
 }
 
 static long madvise_populate(struct madvise_behavior *madv_behavior)
@@ -1336,109 +1476,197 @@ static bool can_madvise_modify(struct madvise_behavior *madv_behavior)
  * will handle splitting a vm area into separate areas, each area with its own
  * behavior.
  */
-static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
+#define MVMA_DIRECT		0
+#define MVMA_CONVERT		1
+#define MVMA_UPDATE		2
+
+struct rust_mvma_state {
+	struct madvise_behavior *m;
+	vm_flags_t new_flags;
+};
+
+static int mvma_convert(int error)
 {
+	if (error == -ENOMEM)
+		error = -EAGAIN;
+	return error;
+}
+
+static int mvma_classify(struct rust_mvma_state *s, int *out)
+{
+	struct madvise_behavior *madv_behavior = s->m;
 	int behavior = madv_behavior->behavior;
 	struct vm_area_struct *vma = madv_behavior->vma;
-	vm_flags_t new_flags = vma->vm_flags;
 	struct madvise_behavior_range *range = &madv_behavior->range;
 	int error;
 
-	if (unlikely(!can_madvise_modify(madv_behavior)))
-		return -EPERM;
+	*out = 0;
+	s->new_flags = vma->vm_flags;
+
+	if (unlikely(!can_madvise_modify(madv_behavior))) {
+		*out = -EPERM;
+		return MVMA_DIRECT;
+	}
 
 	switch (behavior) {
 	case MADV_REMOVE:
-		return madvise_remove(madv_behavior);
+		*out = madvise_remove(madv_behavior);
+		return MVMA_DIRECT;
 	case MADV_WILLNEED:
-		return madvise_willneed(madv_behavior);
+		*out = madvise_willneed(madv_behavior);
+		return MVMA_DIRECT;
 	case MADV_COLD:
-		return madvise_cold(madv_behavior);
+		*out = madvise_cold(madv_behavior);
+		return MVMA_DIRECT;
 	case MADV_PAGEOUT:
-		return madvise_pageout(madv_behavior);
+		*out = madvise_pageout(madv_behavior);
+		return MVMA_DIRECT;
 	case MADV_FREE:
 	case MADV_DONTNEED:
 	case MADV_DONTNEED_LOCKED:
-		return madvise_dontneed_free(madv_behavior);
+		*out = madvise_dontneed_free(madv_behavior);
+		return MVMA_DIRECT;
 	case MADV_COLLAPSE:
-		return madvise_collapse(vma, range->start, range->end,
-			&madv_behavior->lock_dropped);
+		*out = madvise_collapse(vma, range->start, range->end,
+					&madv_behavior->lock_dropped);
+		return MVMA_DIRECT;
 	case MADV_GUARD_INSTALL:
-		return madvise_guard_install(madv_behavior);
+		*out = madvise_guard_install(madv_behavior);
+		return MVMA_DIRECT;
 	case MADV_GUARD_REMOVE:
-		return madvise_guard_remove(madv_behavior);
+		*out = madvise_guard_remove(madv_behavior);
+		return MVMA_DIRECT;
 
 	/* The below behaviours update VMAs via madvise_update_vma(). */
 
 	case MADV_NORMAL:
-		new_flags = new_flags & ~VM_RAND_READ & ~VM_SEQ_READ;
-		break;
+		s->new_flags = s->new_flags & ~VM_RAND_READ & ~VM_SEQ_READ;
+		return MVMA_UPDATE;
 	case MADV_SEQUENTIAL:
-		new_flags = (new_flags & ~VM_RAND_READ) | VM_SEQ_READ;
-		break;
+		s->new_flags = (s->new_flags & ~VM_RAND_READ) | VM_SEQ_READ;
+		return MVMA_UPDATE;
 	case MADV_RANDOM:
-		new_flags = (new_flags & ~VM_SEQ_READ) | VM_RAND_READ;
-		break;
+		s->new_flags = (s->new_flags & ~VM_SEQ_READ) | VM_RAND_READ;
+		return MVMA_UPDATE;
 	case MADV_DONTFORK:
-		new_flags |= VM_DONTCOPY;
-		break;
+		s->new_flags |= VM_DONTCOPY;
+		return MVMA_UPDATE;
 	case MADV_DOFORK:
-		if (new_flags & VM_SPECIAL)
-			return -EINVAL;
-		new_flags &= ~VM_DONTCOPY;
-		break;
+		if (s->new_flags & VM_SPECIAL) {
+			*out = -EINVAL;
+			return MVMA_DIRECT;
+		}
+		s->new_flags &= ~VM_DONTCOPY;
+		return MVMA_UPDATE;
 	case MADV_WIPEONFORK:
 		/* MADV_WIPEONFORK is only supported on anonymous memory. */
-		if (vma->vm_file || new_flags & VM_SHARED)
-			return -EINVAL;
-		new_flags |= VM_WIPEONFORK;
-		break;
+		if (vma->vm_file || s->new_flags & VM_SHARED) {
+			*out = -EINVAL;
+			return MVMA_DIRECT;
+		}
+		s->new_flags |= VM_WIPEONFORK;
+		return MVMA_UPDATE;
 	case MADV_KEEPONFORK:
-		if (new_flags & VM_DROPPABLE)
-			return -EINVAL;
-		new_flags &= ~VM_WIPEONFORK;
-		break;
+		if (s->new_flags & VM_DROPPABLE) {
+			*out = -EINVAL;
+			return MVMA_DIRECT;
+		}
+		s->new_flags &= ~VM_WIPEONFORK;
+		return MVMA_UPDATE;
 	case MADV_DONTDUMP:
-		new_flags |= VM_DONTDUMP;
-		break;
+		s->new_flags |= VM_DONTDUMP;
+		return MVMA_UPDATE;
 	case MADV_DODUMP:
-		if ((!is_vm_hugetlb_page(vma) && (new_flags & VM_SPECIAL)) ||
-		    (new_flags & VM_DROPPABLE))
-			return -EINVAL;
-		new_flags &= ~VM_DONTDUMP;
-		break;
+		if ((!is_vm_hugetlb_page(vma) && (s->new_flags & VM_SPECIAL)) ||
+		    (s->new_flags & VM_DROPPABLE)) {
+			*out = -EINVAL;
+			return MVMA_DIRECT;
+		}
+		s->new_flags &= ~VM_DONTDUMP;
+		return MVMA_UPDATE;
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
 		error = ksm_madvise(vma, range->start, range->end,
-				behavior, &new_flags);
-		if (error)
-			goto out;
-		break;
+				    behavior, &s->new_flags);
+		if (error) {
+			*out = error;
+			return MVMA_CONVERT;
+		}
+		return MVMA_UPDATE;
 	case MADV_HUGEPAGE:
 	case MADV_NOHUGEPAGE:
-		error = hugepage_madvise(vma, &new_flags, behavior);
-		if (error)
-			goto out;
-		break;
+		error = hugepage_madvise(vma, &s->new_flags, behavior);
+		if (error) {
+			*out = error;
+			return MVMA_CONVERT;
+		}
+		return MVMA_UPDATE;
 	case __MADV_SET_ANON_VMA_NAME:
 		/* Only anonymous mappings can be named */
-		if (vma->vm_file && !vma_is_anon_shmem(vma))
-			return -EBADF;
-		break;
+		if (vma->vm_file && !vma_is_anon_shmem(vma)) {
+			*out = -EBADF;
+			return MVMA_DIRECT;
+		}
+		return MVMA_UPDATE;
 	}
 
-	/* This is a write operation.*/
-	VM_WARN_ON_ONCE(madv_behavior->lock_mode != MADVISE_MMAP_WRITE_LOCK);
+	return MVMA_UPDATE;
+}
 
-	error = madvise_update_vma(new_flags, madv_behavior);
-out:
-	/*
-	 * madvise() returns EAGAIN if kernel resources, such as
-	 * slab, are temporarily unavailable.
-	 */
-	if (error == -ENOMEM)
-		error = -EAGAIN;
-	return error;
+static int mvma_update(struct rust_mvma_state *s)
+{
+	int error;
+
+	/* This is a write operation.*/
+	VM_WARN_ON_ONCE(s->m->lock_mode != MADVISE_MMAP_WRITE_LOCK);
+	error = madvise_update_vma(s->new_flags, s->m);
+	return mvma_convert(error);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mvma_classify(struct rust_mvma_state *s, int *out)
+{
+	return mvma_classify(s, out);
+}
+
+int rust_mvma_convert(int error)
+{
+	return mvma_convert(error);
+}
+
+int rust_mvma_update(struct rust_mvma_state *s)
+{
+	return mvma_update(s);
+}
+#endif
+
+static int finish_mvma(struct rust_mvma_state *s)
+{
+	int out = 0;
+	int kind;
+
+	kind = mvma_classify(s, &out);
+	if (kind == MVMA_DIRECT)
+		return out;
+	if (kind == MVMA_CONVERT)
+		return mvma_convert(out);
+	return mvma_update(s);
+}
+
+static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
+{
+	struct rust_mvma_state s = {
+		.m = madv_behavior,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mvma_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mvma(&s);
 }
 
 #ifdef CONFIG_MEMORY_FAILURE

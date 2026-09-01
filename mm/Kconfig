@@ -223,7 +223,10 @@ config RUST_MMAP
 	  (validate vs residency walk), and process_madvise's vector
 	  walk (lock vs per-iov), madvise_do_behavior (poison vs
 	  populate vs VMA walk), and madvise_walk_vmas (single-VMA
-	  readlock vs iter). Maple-tree VMA storage and the
+	  readlock vs iter), madvise_vma_behavior (action vs
+	  flag update), madvise_dontneed_free (validate vs zap vs
+	  MADV_FREE), and madvise_update_vma (no-op vs name vs flags).
+	  Maple-tree VMA storage and the
 	  merge/new-VMA bodies stay in C.
 
 	  If unsure, say N.

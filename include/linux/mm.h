@@ -4531,6 +4531,29 @@ int rust_mdo_walk(struct madvise_behavior *m);
 int rust_mwalk_dispatch(struct madvise_behavior *m, int *handled);
 int rust_mwalk_start(struct madvise_behavior *m, int *out);
 int rust_mwalk_iter(struct madvise_behavior *m);
+struct rust_mvma_state;
+#define RUST_MVMA_DIRECT	0
+#define RUST_MVMA_CONVERT	1
+#define RUST_MVMA_UPDATE	2
+int rust_mvma_dispatch(struct rust_mvma_state *s, int *handled);
+int rust_mvma_classify(struct rust_mvma_state *s, int *out);
+int rust_mvma_convert(int error);
+int rust_mvma_update(struct rust_mvma_state *s);
+#define RUST_MDNF_DONE		0
+#define RUST_MDNF_DONTNEED	1
+#define RUST_MDNF_FREE		2
+long rust_mdnf_dispatch(struct madvise_behavior *m, int *handled);
+int rust_mdnf_classify(struct madvise_behavior *m, long *out);
+long rust_mdnf_dontneed(struct madvise_behavior *m);
+long rust_mdnf_free(struct madvise_behavior *m);
+struct rust_mupd_state;
+#define RUST_MUPD_DONE		0
+#define RUST_MUPD_NAME		1
+#define RUST_MUPD_FLAGS		2
+int rust_mupd_dispatch(struct rust_mupd_state *s, int *handled);
+int rust_mupd_classify(struct rust_mupd_state *s, int *out);
+int rust_mupd_name(struct rust_mupd_state *s);
+int rust_mupd_flags(struct rust_mupd_state *s);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0
