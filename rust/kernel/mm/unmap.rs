@@ -26,9 +26,9 @@
 //! (pidfd/iovec vs vector walk), `vm_brk_flags` (lock/limits vs munmap
 //! vs do_brk vs populate), `vma_merge_existing_range` (no-merge vs
 //! both/left/right), `vma_expand` (dup vs commit), and `expand_stack`
-//! (found vs grow-up vs grow-down).
-//! Maple-tree expand/store and the merge / new-VMA file mmap/shmem /
-//! `change_protection` / page-table move / madvise per-hint / seal-range /
+//! (found vs grow-up vs grow-down). The VMA maple tree is a Rust RCU
+//! range array.
+//! File mmap/shmem / `change_protection` / page-table move / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
 //! held by the C caller except for mprotect, mremap, madvise, mseal,
 //! mlock, munlock, mlockall, munlockall, msync, mincore,
@@ -466,6 +466,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
     pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack sequencer\n");
+    crate::mm::mtree::announce_once();
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.

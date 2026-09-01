@@ -1238,6 +1238,13 @@ static void mas_may_init_lock_check(struct ma_state *mas)
  */
 static inline struct maple_enode *mas_start(struct ma_state *mas)
 {
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas)) {
+		if (!mas_is_start(mas))
+			return NULL;
+		return rust_mas_walk(mas);
+	}
+#endif
 	if (likely(mas_is_start(mas))) {
 		struct maple_enode *root;
 
@@ -3003,6 +3010,11 @@ static inline void *mas_state_walk(struct ma_state *mas)
 {
 	void *entry;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_walk(mas);
+#endif
+
 	entry = mas_start(mas);
 	if (mas_is_none(mas))
 		return NULL;
@@ -3818,6 +3830,11 @@ static inline void *mas_insert(struct ma_state *mas, void *entry)
 {
 	MA_WR_STATE(wr_mas, mas, entry);
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_insert(mas, entry);
+#endif
+
 	/*
 	 * Inserting a new range inserts either 0, 1, or 2 pivots within the
 	 * tree.  If the insert fits exactly into an existing gap with a value
@@ -4452,6 +4469,11 @@ void *mas_walk(struct ma_state *mas)
 {
 	void *entry;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_walk(mas);
+#endif
+
 	mas_may_init_lock_check(mas);
 	mas_make_walkable(mas);
 retry:
@@ -4598,6 +4620,11 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
 	enum maple_type mt;
 	struct maple_node *node;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_empty_area(mas, min, max, size);
+#endif
+
 	if (min > max)
 		return -EINVAL;
 
@@ -4648,6 +4675,11 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 		unsigned long max, unsigned long size)
 {
 	struct maple_enode *last = mas->node;
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_empty_area_rev(mas, min, max, size);
+#endif
 
 	if (min > max)
 		return -EINVAL;
@@ -4923,6 +4955,11 @@ void *mas_store(struct ma_state *mas, void *entry)
 {
 	MA_WR_STATE(wr_mas, mas, entry);
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_store(mas, entry);
+#endif
+
 	mas_may_init_lock_check(mas);
 	trace_ma_write(TP_FCT, mas, 0, entry);
 #ifdef CONFIG_DEBUG_MAPLE_TREE
@@ -4982,6 +5019,11 @@ int mas_store_gfp(struct ma_state *mas, void *entry, gfp_t gfp)
 	MA_WR_STATE(wr_mas, mas, entry);
 	int ret = 0;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_store_gfp(mas, entry, gfp);
+#endif
+
 	mas_may_init_lock_check(mas);
 retry:
 	mas_wr_preallocate(&wr_mas, entry);
@@ -5012,6 +5054,13 @@ EXPORT_SYMBOL_GPL(mas_store_gfp);
 void mas_store_prealloc(struct ma_state *mas, void *entry)
 {
 	MA_WR_STATE(wr_mas, mas, entry);
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas)) {
+		rust_mas_store_prealloc(mas, entry);
+		return;
+	}
+#endif
 
 	mas_lock_check(mas);
 	if (mas->store_type == wr_store_root) {
@@ -5045,6 +5094,11 @@ EXPORT_SYMBOL_GPL(mas_store_prealloc);
 int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
 {
 	MA_WR_STATE(wr_mas, mas, entry);
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_preallocate(mas, entry, gfp);
+#endif
 
 	mas_may_init_lock_check(mas);
 	mas_wr_prealloc_setup(&wr_mas);
@@ -5080,6 +5134,13 @@ EXPORT_SYMBOL_GPL(mas_preallocate);
  */
 void mas_destroy(struct ma_state *mas)
 {
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas)) {
+		rust_mas_destroy(mas);
+		return;
+	}
+#endif
+
 	mas->mas_flags &= ~MA_STATE_PREALLOC;
 	mas_empty_nodes(mas);
 }
@@ -5171,6 +5232,11 @@ void *mas_next(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_next(mas, max);
+#endif
+
 	mas_may_init_lock_check(mas);
 	if (mas_next_setup(mas, max, &entry))
 		return entry;
@@ -5194,6 +5260,11 @@ EXPORT_SYMBOL_GPL(mas_next);
 void *mas_next_range(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_next_range(mas, max);
+#endif
 
 	mas_may_init_lock_check(mas);
 	if (mas_next_setup(mas, max, &entry))
@@ -5304,6 +5375,11 @@ void *mas_prev(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_prev(mas, min);
+#endif
+
 	mas_may_init_lock_check(mas);
 	if (mas_prev_setup(mas, min, &entry))
 		return entry;
@@ -5327,6 +5403,11 @@ EXPORT_SYMBOL_GPL(mas_prev);
 void *mas_prev_range(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_prev_range(mas, min);
+#endif
 
 	mas_may_init_lock_check(mas);
 	if (mas_prev_setup(mas, min, &entry))
@@ -5484,6 +5565,11 @@ void *mas_find(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_find(mas, max);
+#endif
+
 	mas_may_init_lock_check(mas);
 	if (mas_find_setup(mas, max, &entry))
 		return entry;
@@ -5511,6 +5597,11 @@ EXPORT_SYMBOL_GPL(mas_find);
 void *mas_find_range(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_find_range(mas, max);
+#endif
 
 	mas_may_init_lock_check(mas);
 	if (mas_find_setup(mas, max, &entry))
@@ -5624,6 +5715,11 @@ void *mas_find_rev(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
 
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_find_rev(mas, min);
+#endif
+
 	mas_may_init_lock_check(mas);
 	if (mas_find_rev_setup(mas, min, &entry))
 		return entry;
@@ -5650,6 +5746,11 @@ EXPORT_SYMBOL_GPL(mas_find_rev);
 void *mas_find_range_rev(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_find_range_rev(mas, min);
+#endif
 
 	mas_may_init_lock_check(mas);
 	if (mas_find_rev_setup(mas, min, &entry))
@@ -5681,6 +5782,11 @@ void *mas_erase(struct ma_state *mas)
 	void *entry;
 	unsigned long index = mas->index;
 	MA_WR_STATE(wr_mas, mas, NULL);
+
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return rust_mas_erase(mas);
+#endif
 
 	/*
 	 * In low memory situations, the allocation is retried with the gfp flag
@@ -5720,6 +5826,10 @@ EXPORT_SYMBOL_GPL(mas_erase);
 bool mas_nomem(struct ma_state *mas, gfp_t gfp)
 	__must_hold(mas->tree->ma_lock)
 {
+#ifdef CONFIG_RUST_MMAP
+	if (mas_is_rust(mas))
+		return false;
+#endif
 	if (likely(mas->node != MA_ERROR(-ENOMEM)))
 		return false;
 
@@ -5804,6 +5914,15 @@ void *mtree_load(struct maple_tree *mt, unsigned long index)
 {
 	MA_STATE(mas, mt, index, index);
 	void *entry;
+
+#ifdef CONFIG_RUST_MMAP
+	if (mt_is_rust(mt)) {
+		rcu_read_lock();
+		entry = rust_mt_load(mt, index);
+		rcu_read_unlock();
+		return entry;
+	}
+#endif
 
 	trace_ma_read(TP_FCT, &mas);
 	rcu_read_lock();
@@ -6315,6 +6434,11 @@ int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp)
 	MA_STATE(mas, mt, 0, 0);
 	MA_STATE(new_mas, new, 0, 0);
 
+#ifdef CONFIG_RUST_MMAP
+	if (mt_is_rust(mt))
+		return rust_mt_dup(mt, new, gfp);
+#endif
+
 	mas_dup_build(&mas, &new_mas, gfp);
 	if (unlikely(mas_is_err(&mas))) {
 		ret = xa_err(mas.node);
@@ -6352,6 +6476,11 @@ int mtree_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp)
 	MA_STATE(mas, mt, 0, 0);
 	MA_STATE(new_mas, new, 0, 0);
 
+#ifdef CONFIG_RUST_MMAP
+	if (mt_is_rust(mt))
+		return rust_mt_dup(mt, new, gfp);
+#endif
+
 	mas_lock(&new_mas);
 	mas_lock_nested(&mas, SINGLE_DEPTH_NESTING);
 	mas_dup_build(&mas, &new_mas, gfp);
@@ -6376,6 +6505,13 @@ EXPORT_SYMBOL(mtree_dup);
 void __mt_destroy(struct maple_tree *mt)
 {
 	void *root = mt_root_locked(mt);
+
+#ifdef CONFIG_RUST_MMAP
+	if (mt_is_rust(mt)) {
+		rust_mt_destroy(mt);
+		return;
+	}
+#endif
 
 	rcu_assign_pointer(mt->ma_root, NULL);
 	if (xa_is_node(root))
@@ -6421,6 +6557,19 @@ void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max)
 	void *entry;
 #ifdef CONFIG_DEBUG_MAPLE_TREE
 	unsigned long copy = *index;
+#endif
+
+#ifdef CONFIG_RUST_MMAP
+	if (mt_is_rust(mt)) {
+		if ((*index) > max)
+			return NULL;
+		rcu_read_lock();
+		entry = rust_mas_find(&mas, max);
+		rcu_read_unlock();
+		if (likely(entry))
+			*index = mas.last + 1;
+		return entry;
+	}
 #endif
 
 	trace_ma_read(TP_FCT, &mas);

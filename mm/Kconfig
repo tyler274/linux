@@ -232,8 +232,9 @@ config RUST_MMAP
 	  walk), vm_brk_flags (lock/limits vs munmap vs do_brk vs
 	  populate), and vma_merge_existing_range (no-merge vs
 	  both/left/right), vma_expand (dup vs commit), and expand_stack
-	  (found vs grow-up vs grow-down). Maple-tree expand/store
-	  and the new-VMA file mmap/shmem bodies stay in C.
+	  (found vs grow-up vs grow-down). The VMA maple tree is a Rust
+	  RCU range array; irq and other maple trees stay in C. File
+	  mmap/shmem bodies stay in C.
 
 	  If unsure, say N.
 

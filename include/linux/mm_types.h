@@ -1459,7 +1459,7 @@ static inline void __mm_flags_set_mask_bits_word(struct mm_struct *mm,
 }
 
 #define MM_MT_FLAGS	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN | \
-			 MT_FLAGS_USE_RCU)
+			 MT_FLAGS_USE_RCU | MT_FLAGS_RUST)
 extern struct mm_struct init_mm;
 
 #define MM_STRUCT_FLEXIBLE_ARRAY_INIT				\

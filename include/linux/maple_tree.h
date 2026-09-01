@@ -215,6 +215,11 @@ struct maple_copy {
 #define MT_FLAGS_LOCK_BH	0x200
 #define MT_FLAGS_LOCK_EXTERN	0x300
 #define MT_FLAGS_ALLOC_WRAPPED	0x0800
+#ifdef CONFIG_RUST_MMAP
+#define MT_FLAGS_RUST		0x0400
+#else
+#define MT_FLAGS_RUST		0x0000
+#endif
 
 #define MAPLE_HEIGHT_MAX	31
 
@@ -565,6 +570,31 @@ void *mas_find_range(struct ma_state *mas, unsigned long max);
 void *mas_find_rev(struct ma_state *mas, unsigned long min);
 void *mas_find_range_rev(struct ma_state *mas, unsigned long max);
 int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp);
+#ifdef CONFIG_RUST_MMAP
+void *rust_mt_load(struct maple_tree *mt, unsigned long index);
+void *rust_mas_walk(struct ma_state *mas);
+void *rust_mas_store(struct ma_state *mas, void *entry);
+int rust_mas_store_gfp(struct ma_state *mas, void *entry, gfp_t gfp);
+void rust_mas_store_prealloc(struct ma_state *mas, void *entry);
+int rust_mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp);
+void rust_mas_destroy(struct ma_state *mas);
+void *rust_mas_find(struct ma_state *mas, unsigned long max);
+void *rust_mas_find_range(struct ma_state *mas, unsigned long max);
+void *rust_mas_find_rev(struct ma_state *mas, unsigned long min);
+void *rust_mas_find_range_rev(struct ma_state *mas, unsigned long min);
+void *rust_mas_next(struct ma_state *mas, unsigned long max);
+void *rust_mas_next_range(struct ma_state *mas, unsigned long max);
+void *rust_mas_prev(struct ma_state *mas, unsigned long min);
+void *rust_mas_prev_range(struct ma_state *mas, unsigned long min);
+void *rust_mas_erase(struct ma_state *mas);
+void *rust_mas_insert(struct ma_state *mas, void *entry);
+int rust_mas_empty_area(struct ma_state *mas, unsigned long min,
+			unsigned long max, unsigned long size);
+int rust_mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+			    unsigned long max, unsigned long size);
+void rust_mt_destroy(struct maple_tree *mt);
+int rust_mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
+#endif
 int mas_alloc_cyclic(struct ma_state *mas, unsigned long *startp,
 		void *entry, unsigned long range_lo, unsigned long range_hi,
 		unsigned long *next, gfp_t gfp);
@@ -870,6 +900,16 @@ static inline void mt_init(struct maple_tree *mt)
 static inline bool mt_in_rcu(struct maple_tree *mt)
 {
 	return mt->ma_flags & MT_FLAGS_USE_RCU;
+}
+
+static inline bool mt_is_rust(const struct maple_tree *mt)
+{
+	return mt && (mt->ma_flags & MT_FLAGS_RUST);
+}
+
+static inline bool mas_is_rust(const struct ma_state *mas)
+{
+	return mas && mt_is_rust(mas->tree);
 }
 
 /**
