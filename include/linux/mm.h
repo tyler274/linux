@@ -4466,6 +4466,27 @@ int rust_mlfix_dispatch(struct rust_mlfix_state *s, int *handled);
 int rust_mlfix_prepare(struct rust_mlfix_state *s, int *out);
 int rust_mlfix_modify(struct rust_mlfix_state *s, int *out);
 int rust_mlfix_pages(struct rust_mlfix_state *s);
+struct rust_mprot_walk;
+#define RUST_MPWALK_DONE	0
+#define RUST_MPWALK_WALK	1
+int rust_mprot_dispatch(struct rust_mprot_walk *s, int *handled);
+int rust_mprot_lock(struct rust_mprot_walk *s, int *out);
+int rust_mprot_walk(struct rust_mprot_walk *s);
+void rust_mprot_unlock(void);
+#define RUST_MUNLOCK_DONE	0
+#define RUST_MUNLOCK_APPLY	1
+int rust_munlock_dispatch(unsigned long *start, size_t *len, int *handled);
+int rust_munlock_prepare(unsigned long *start, size_t *len, int *out);
+int rust_munlock_apply(unsigned long start, size_t len);
+#define RUST_MLOCKALL_DONE	0
+#define RUST_MLOCKALL_CONT	1
+#define RUST_MLOCKALL_POPULATE	2
+int rust_mlockall_dispatch(int flags, int *handled);
+int rust_mlockall_prepare(int flags, int *out);
+int rust_mlockall_apply(int flags, int *out);
+void rust_mlockall_populate(void);
+int rust_munlockall_dispatch(int *handled);
+int rust_munlockall_apply(void);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

@@ -1030,24 +1030,31 @@ static int mprotect_validate(struct rust_mprotect_req *req, int *out)
 	return MPROTECT_APPLY;
 }
 
-static int mprotect_apply(struct rust_mprotect_req *req)
-{
-	unsigned long nstart, end, tmp, reqprot, prot, start;
-	struct vm_area_struct *vma, *prev;
-	int error;
-	const int grows = req->grows;
-	const bool rier = req->rier;
-	int pkey = req->pkey;
-	struct mmu_gather tlb;
+#define MPWALK_DONE		0
+#define MPWALK_WALK		1
+
+struct rust_mprot_walk {
+	struct rust_mprotect_req *req;
 	struct vma_iterator vmi;
+	struct vm_area_struct *vma;
+	struct vm_area_struct *prev;
+};
 
-	start = req->start;
-	end = req->end;
-	prot = req->prot;
-	reqprot = req->reqprot;
+static int mprotect_lock(struct rust_mprot_walk *s, int *out)
+{
+	struct rust_mprotect_req *req = s->req;
+	unsigned long start = req->start;
+	unsigned long end = req->end;
+	const int grows = req->grows;
+	int pkey = req->pkey;
+	int error;
+	struct vm_area_struct *vma;
 
-	if (mmap_write_lock_killable(current->mm))
-		return -EINTR;
+	*out = 0;
+	if (mmap_write_lock_killable(current->mm)) {
+		*out = -EINTR;
+		return MPWALK_DONE;
+	}
 
 	/*
 	 * If userspace did not allocate the pkey, do not let
@@ -1055,40 +1062,66 @@ static int mprotect_apply(struct rust_mprotect_req *req)
 	 */
 	error = -EINVAL;
 	if ((pkey != -1) && !mm_pkey_is_allocated(current->mm, pkey))
-		goto out;
+		goto out_unlock;
 
-	vma_iter_init(&vmi, current->mm, start);
-	vma = vma_find(&vmi, end);
+	vma_iter_init(&s->vmi, current->mm, start);
+	vma = vma_find(&s->vmi, end);
 	error = -ENOMEM;
 	if (!vma)
-		goto out;
+		goto out_unlock;
 
 	if (unlikely(grows & PROT_GROWSDOWN)) {
 		if (vma->vm_start >= end)
-			goto out;
+			goto out_unlock;
 		start = vma->vm_start;
 		error = -EINVAL;
 		if (!vma_test(vma, VMA_GROWSDOWN_BIT))
-			goto out;
+			goto out_unlock;
 	} else {
 		if (vma->vm_start > start)
-			goto out;
+			goto out_unlock;
 		if (unlikely(grows & PROT_GROWSUP)) {
 			end = vma->vm_end;
 			error = -EINVAL;
 			if (!vma_test_single_mask(vma, VMA_GROWSUP))
-				goto out;
+				goto out_unlock;
 		}
 	}
 
-	prev = vma_prev(&vmi);
+	s->prev = vma_prev(&s->vmi);
 	if (start > vma->vm_start)
-		prev = vma;
+		s->prev = vma;
+	s->vma = vma;
+	req->start = start;
+	req->end = end;
+	return MPWALK_WALK;
+
+out_unlock:
+	mmap_write_unlock(current->mm);
+	*out = error;
+	return MPWALK_DONE;
+}
+
+static int mprotect_walk(struct rust_mprot_walk *s)
+{
+	struct rust_mprotect_req *req = s->req;
+	unsigned long nstart, end, tmp, reqprot, prot;
+	struct vm_area_struct *vma, *prev;
+	int error = 0;
+	const bool rier = req->rier;
+	int pkey = req->pkey;
+	struct mmu_gather tlb;
+
+	end = req->end;
+	prot = req->prot;
+	reqprot = req->reqprot;
+	vma = s->vma;
+	prev = s->prev;
+	nstart = req->start;
+	tmp = vma->vm_start;
 
 	tlb_gather_mmu(&tlb, current->mm);
-	nstart = start;
-	tmp = vma->vm_start;
-	for_each_vma_range(vmi, vma, end) {
+	for_each_vma_range(s->vmi, vma, end) {
 		vm_flags_t mask_off_old_flags;
 		vma_flags_t new_vma_flags;
 		vm_flags_t newflags;
@@ -1146,11 +1179,12 @@ static int mprotect_apply(struct rust_mprotect_req *req)
 				break;
 		}
 
-		error = mprotect_fixup(&vmi, &tlb, vma, &prev, nstart, tmp, newflags);
+		error = mprotect_fixup(&s->vmi, &tlb, vma, &prev, nstart, tmp,
+				       newflags);
 		if (error)
 			break;
 
-		tmp = vma_iter_end(&vmi);
+		tmp = vma_iter_end(&s->vmi);
 		nstart = tmp;
 		prot = reqprot;
 	}
@@ -1159,9 +1193,53 @@ static int mprotect_apply(struct rust_mprotect_req *req)
 	if (!error && tmp < end)
 		error = -ENOMEM;
 
-out:
 	mmap_write_unlock(current->mm);
 	return error;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mprot_lock(struct rust_mprot_walk *s, int *out)
+{
+	return mprotect_lock(s, out);
+}
+
+int rust_mprot_walk(struct rust_mprot_walk *s)
+{
+	return mprotect_walk(s);
+}
+
+void rust_mprot_unlock(void)
+{
+	mmap_write_unlock(current->mm);
+}
+#endif
+
+static int finish_mprot(struct rust_mprot_walk *s)
+{
+	int out = 0;
+	int kind;
+
+	kind = mprotect_lock(s, &out);
+	if (kind == MPWALK_DONE)
+		return out;
+	return mprotect_walk(s);
+}
+
+static int mprotect_apply(struct rust_mprotect_req *req)
+{
+	struct rust_mprot_walk s = {
+		.req = req,
+	};
+
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mprot_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mprot(&s);
 }
 
 #ifdef CONFIG_RUST_MMAP

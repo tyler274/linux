@@ -11,12 +11,14 @@
 //! `vma_modify_flags` vs `change_protection`), `do_mremap` (move vs
 //! `mremap_to` vs `mremap_at`), `do_madvise` (validate vs lock/walk),
 //! `mseal` (validate vs lock/seal), `do_mlock` (prepare vs lock/apply vs
-//! populate), and `mlock_fixup` (filter vs `vma_modify_flags` vs pages).
+//! populate), `mlock_fixup` (filter vs `vma_modify_flags` vs pages),
+//! mprotect VMA walk (lock/pkey/grows vs per-VMA `mprotect_fixup`),
+//! `munlock`, `mlockall`, and `munlockall`.
 //! Maple-tree storage and the merge / new-VMA / `change_protection` /
 //! page-table move / madvise VMA-walk / seal-range / mlock page-walk
 //! bodies stay in C. The mmap lock is already held by the C caller except
-//! for mprotect, mremap, madvise, mseal, and mlock, which take it in
-//! apply / lock.
+//! for mprotect, mremap, madvise, mseal, mlock, munlock, mlockall, and
+//! munlockall, which take it in apply / lock.
 
 use crate::{
     bindings,
@@ -116,6 +118,23 @@ const MLFIX_MODIFY: i32 = 1;
 /// VMA updated; account locked pages and walk PTEs.
 const MLFIX_PAGES: i32 = 2;
 
+/// Matches `RUST_MPWALK_*` in `include/linux/mm.h`.
+const MPWALK_DONE: i32 = 0;
+/// mmap write lock held; walk VMAs then unlock.
+const MPWALK_WALK: i32 = 1;
+
+/// Matches `RUST_MUNLOCK_*` in `include/linux/mm.h`.
+const MUNLOCK_DONE: i32 = 0;
+/// Range aligned; lock and apply unlock flags.
+const MUNLOCK_APPLY: i32 = 1;
+
+/// Matches `RUST_MLOCKALL_*` in `include/linux/mm.h`.
+const MLOCKALL_DONE: i32 = 0;
+/// Flags and capability passed; lock and apply.
+const MLOCKALL_CONT: i32 = 1;
+/// Applied with `MCL_CURRENT`; populate the address space.
+const MLOCKALL_POPULATE: i32 = 2;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
@@ -128,6 +147,10 @@ static N_MPFIX: Atomic<u32> = Atomic::new(0);
 static N_MSEAL: Atomic<u32> = Atomic::new(0);
 static N_MLOCK: Atomic<u32> = Atomic::new(0);
 static N_MLFIX: Atomic<u32> = Atomic::new(0);
+static N_MPWALK: Atomic<u32> = Atomic::new(0);
+static N_MUNLOCK: Atomic<u32> = Atomic::new(0);
+static N_MLOCKALL: Atomic<u32> = Atomic::new(0);
+static N_MUNLOCKALL: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -316,7 +339,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1053,4 +1076,171 @@ pub unsafe extern "C" fn rust_mlfix_dispatch(
 
     // SAFETY: `s->vma` is the live mapping after modify.
     unsafe { bindings::rust_mlfix_pages(s) }
+}
+
+/// C ABI: sequence the `mprotect` VMA walk after C takes the mmap lock.
+///
+/// Sets `*handled` once lock/pkey/grows setup has run. Failure paths
+/// unlock before returning `DONE`. The per-VMA flag calc and
+/// `mprotect_fixup` stay in C.
+///
+/// # Safety
+///
+/// `s` must be live stack state from `mprotect_apply`. `handled` must
+/// be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mprot_dispatch(
+    s: *mut bindings::rust_mprot_walk,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `s->req` holds the validated range.
+    let kind = unsafe { bindings::rust_mprot_lock(s, &mut out) };
+    // SAFETY: `handled` is valid. Lock-fail already dropped the lock.
+    unsafe { *handled = 1 };
+
+    let prev = N_MPWALK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mprotect walk sequenced\n");
+    }
+
+    if kind == MPWALK_DONE {
+        return out;
+    }
+    if kind != MPWALK_WALK {
+        pr_err!("rust-mmap: unknown mprotect lock kind {kind}\n");
+        // SAFETY: Unexpected kind after a successful lock; drop it.
+        unsafe { bindings::rust_mprot_unlock() };
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: mmap write lock held; iterator is positioned on the range.
+    unsafe { bindings::rust_mprot_walk(s) }
+}
+
+/// C ABI: sequence `munlock` after C aligns the range.
+///
+/// Sets `*handled` once prepare has run. The mmap lock and VMA walk
+/// stay in C.
+///
+/// # Safety
+///
+/// `start`, `len`, and `handled` must be valid. Prepare may rewrite
+/// `*start` and `*len`. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_munlock_dispatch(
+    start: *mut c_ulong,
+    len: *mut usize,
+    handled: *mut c_int,
+) -> c_int {
+    if start.is_null() || len.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; pointers are the syscall arguments.
+    let kind = unsafe { bindings::rust_munlock_prepare(start, len, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MUNLOCK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first munlock sequenced\n");
+    }
+
+    match kind {
+        MUNLOCK_DONE => out,
+        // SAFETY: Range is aligned; apply takes the mmap write lock.
+        MUNLOCK_APPLY => unsafe { bindings::rust_munlock_apply(*start, *len) },
+        _ => {
+            pr_err!("rust-mmap: unknown munlock kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `mlockall` after C validates flags and capability.
+///
+/// Sets `*handled` once prepare has run. Lock-fail and apply-fail skip
+/// populate. `MCL_CURRENT` success populates after unlock.
+///
+/// # Safety
+///
+/// `handled` must be a valid out-parameter. No mmap lock is held on
+/// entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mlockall_dispatch(flags: c_int, handled: *mut c_int) -> c_int {
+    if handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `flags` is the syscall argument.
+    let kind = unsafe { bindings::rust_mlockall_prepare(flags, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MLOCKALL.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mlockall sequenced\n");
+    }
+
+    if kind == MLOCKALL_DONE {
+        return out;
+    }
+    if kind != MLOCKALL_CONT {
+        pr_err!("rust-mmap: unknown mlockall prepare kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: Flags ok; apply takes the mmap write lock.
+    let kind = unsafe { bindings::rust_mlockall_apply(flags, &mut out) };
+    if kind == MLOCKALL_DONE {
+        return out;
+    }
+    if kind != MLOCKALL_POPULATE {
+        pr_err!("rust-mmap: unknown mlockall apply kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: Applied with MCL_CURRENT; mmap lock already dropped.
+    unsafe { bindings::rust_mlockall_populate() };
+    0
+}
+
+/// C ABI: sequence `munlockall` (lock, clear VMA lock flags, unlock).
+///
+/// Sets `*handled` before apply. The mmap lock stays in C.
+///
+/// # Safety
+///
+/// `handled` must be a valid out-parameter. No mmap lock is held on
+/// entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_munlockall_dispatch(handled: *mut c_int) -> c_int {
+    if handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MUNLOCKALL.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first munlockall sequenced\n");
+    }
+
+    // SAFETY: Apply takes and drops the mmap write lock.
+    unsafe { bindings::rust_munlockall_apply() }
 }

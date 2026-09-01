@@ -838,22 +838,69 @@ SYSCALL_DEFINE3(mlock2, unsigned long, start, size_t, len, int, flags)
 	return do_mlock(start, len, &vma_flags);
 }
 
-SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
+#define MUNLOCK_DONE		0
+#define MUNLOCK_APPLY		1
+
+static int munlock_prepare(unsigned long *start, size_t *len, int *out)
+{
+	*out = 0;
+	*start = untagged_addr(*start);
+	*len = PAGE_ALIGN(*len + (offset_in_page(*start)));
+	*start &= PAGE_MASK;
+	return MUNLOCK_APPLY;
+}
+
+static int munlock_apply(unsigned long start, size_t len)
 {
 	vma_flags_t flags = EMPTY_VMA_FLAGS;
 	int ret;
-
-	start = untagged_addr(start);
-
-	len = PAGE_ALIGN(len + (offset_in_page(start)));
-	start &= PAGE_MASK;
 
 	if (mmap_write_lock_killable(current->mm))
 		return -EINTR;
 	ret = apply_vma_lock_flags(start, len, &flags);
 	mmap_write_unlock(current->mm);
-
 	return ret;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_munlock_prepare(unsigned long *start, size_t *len, int *out)
+{
+	return munlock_prepare(start, len, out);
+}
+
+int rust_munlock_apply(unsigned long start, size_t len)
+{
+	return munlock_apply(start, len);
+}
+#endif
+
+static int finish_munlock(unsigned long *start, size_t *len)
+{
+	int out = 0;
+	int kind;
+
+	kind = munlock_prepare(start, len, &out);
+	if (kind == MUNLOCK_DONE)
+		return out;
+	return munlock_apply(*start, *len);
+}
+
+static int do_munlock(unsigned long start, size_t len)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_munlock_dispatch(&start, &len, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_munlock(&start, &len);
+}
+
+SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
+{
+	return do_munlock(start, len);
 }
 
 /*
@@ -909,36 +956,61 @@ out:
 	return 0;
 }
 
-SYSCALL_DEFINE1(mlockall, int, flags)
+#define MLOCKALL_DONE		0
+#define MLOCKALL_CONT		1
+#define MLOCKALL_POPULATE	2
+
+static int mlockall_prepare(int flags, int *out)
+{
+	*out = 0;
+	if (!flags || (flags & ~(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) ||
+	    flags == MCL_ONFAULT) {
+		*out = -EINVAL;
+		return MLOCKALL_DONE;
+	}
+
+	if (!can_do_mlock()) {
+		*out = -EPERM;
+		return MLOCKALL_DONE;
+	}
+
+	return MLOCKALL_CONT;
+}
+
+static int mlockall_apply(int flags, int *out)
 {
 	unsigned long lock_limit;
 	int ret;
 
-	if (!flags || (flags & ~(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) ||
-	    flags == MCL_ONFAULT)
-		return -EINVAL;
-
-	if (!can_do_mlock())
-		return -EPERM;
-
+	*out = 0;
 	lock_limit = rlimit(RLIMIT_MEMLOCK);
 	lock_limit >>= PAGE_SHIFT;
 
-	if (mmap_write_lock_killable(current->mm))
-		return -EINTR;
+	if (mmap_write_lock_killable(current->mm)) {
+		*out = -EINTR;
+		return MLOCKALL_DONE;
+	}
 
 	ret = -ENOMEM;
 	if (!(flags & MCL_CURRENT) || (current->mm->total_vm <= lock_limit) ||
 	    capable(CAP_IPC_LOCK))
 		ret = apply_mlockall_flags(flags);
 	mmap_write_unlock(current->mm);
-	if (!ret && (flags & MCL_CURRENT))
-		mm_populate(0, TASK_SIZE);
-
-	return ret;
+	if (ret) {
+		*out = ret;
+		return MLOCKALL_DONE;
+	}
+	if (flags & MCL_CURRENT)
+		return MLOCKALL_POPULATE;
+	return MLOCKALL_DONE;
 }
 
-SYSCALL_DEFINE0(munlockall)
+static void mlockall_populate(void)
+{
+	mm_populate(0, TASK_SIZE);
+}
+
+static int munlockall_apply(void)
 {
 	int ret;
 
@@ -947,6 +1019,74 @@ SYSCALL_DEFINE0(munlockall)
 	ret = apply_mlockall_flags(0);
 	mmap_write_unlock(current->mm);
 	return ret;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mlockall_prepare(int flags, int *out)
+{
+	return mlockall_prepare(flags, out);
+}
+
+int rust_mlockall_apply(int flags, int *out)
+{
+	return mlockall_apply(flags, out);
+}
+
+void rust_mlockall_populate(void)
+{
+	mlockall_populate();
+}
+
+int rust_munlockall_apply(void)
+{
+	return munlockall_apply();
+}
+#endif
+
+static int finish_mlockall(int flags)
+{
+	int out = 0;
+	int kind;
+
+	kind = mlockall_prepare(flags, &out);
+	if (kind == MLOCKALL_DONE)
+		return out;
+	kind = mlockall_apply(flags, &out);
+	if (kind == MLOCKALL_DONE)
+		return out;
+	mlockall_populate();
+	return 0;
+}
+
+static int do_mlockall(int flags)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mlockall_dispatch(flags, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mlockall(flags);
+}
+
+SYSCALL_DEFINE1(mlockall, int, flags)
+{
+	return do_mlockall(flags);
+}
+
+SYSCALL_DEFINE0(munlockall)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_munlockall_dispatch(&handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return munlockall_apply();
 }
 
 /*
