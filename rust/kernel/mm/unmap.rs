@@ -21,7 +21,9 @@
 //! (direct action vs ENOMEM convert vs `madvise_update_vma`), and
 //! `madvise_dontneed_free` (validate vs zap vs `MADV_FREE`), and
 //! `madvise_update_vma` (no-op vs name vs flags), `vma_merge_new_range`
-//! (no-merge vs expand), and `__mmap_new_vma` (file vs shmem vs store).
+//! (no-merge vs expand), `__mmap_new_vma` (file vs shmem vs store),
+//! `brk` (shrink vs expand vs unlock/populate), and `process_madvise`
+//! (pidfd/iovec vs vector walk).
 //! Maple-tree expand/store and the merge / new-VMA file mmap/shmem /
 //! `change_protection` / page-table move / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
@@ -66,6 +68,16 @@ const BRK_CONT: i32 = 1;
 const BRK_NEW: i32 = 2;
 /// Merge or new succeeded; account the mapping.
 const BRK_ACCT: i32 = 3;
+
+/// Matches `RUST_SYSBRK_*` in `include/linux/mm.h`.
+const SYSBRK_DONE: i32 = 0;
+/// brk updated; unlock if needed, then uffd and maybe populate.
+const SYSBRK_EXIT: i32 = 1;
+
+/// Matches `RUST_PMAD_*` in `include/linux/mm.h`.
+const PMAD_DONE: i32 = 0;
+/// pidfd and iovec acquired; run `vector_madvise` then release.
+const PMAD_APPLY: i32 = 1;
 
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
@@ -209,6 +221,7 @@ const MUPD_FLAGS: i32 = 2;
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
+static N_SYSBRK: Atomic<u32> = Atomic::new(0);
 static N_MPROTECT: Atomic<u32> = Atomic::new(0);
 static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
@@ -232,6 +245,7 @@ static N_MWALK: Atomic<u32> = Atomic::new(0);
 static N_MVMA: Atomic<u32> = Atomic::new(0);
 static N_MDNF: Atomic<u32> = Atomic::new(0);
 static N_MUPD: Atomic<u32> = Atomic::new(0);
+static N_PMAD: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -420,7 +434,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1776,4 +1790,93 @@ pub unsafe extern "C" fn rust_mnva_dispatch(
     }
     // SAFETY: Callbacks succeeded (or anon); insert into the maple tree.
     unsafe { bindings::rust_mnva_store(s) }
+}
+
+/// C ABI: sequence `brk` after C takes the mmap lock and classifies shrink vs expand.
+///
+/// Sets `*handled` once classify has run. Successful shrink may already
+/// have dropped the lock. uffd complete and `mm_populate` stay in C.
+/// Unknown kind after a held lock restores `origbrk` and unlocks.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_sysbrk_state` with `brk` filled. `handled`
+/// must be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_sysbrk_dispatch(
+    s: *mut bindings::rust_sysbrk_state,
+    handled: *mut c_int,
+) -> c_ulong {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_ulong;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_ulong = 0;
+    // SAFETY: `s` is live; classify takes the mmap write lock.
+    let kind = unsafe { bindings::rust_sysbrk_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_SYSBRK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first sys_brk sequenced\n");
+    }
+
+    match kind {
+        SYSBRK_DONE => out,
+        // SAFETY: brk updated; unlock if needed, then uffd/populate.
+        SYSBRK_EXIT => unsafe { bindings::rust_sysbrk_exit(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown sys_brk kind {kind}\n");
+            // SAFETY: Drop a leftover write lock without applying brk.
+            unsafe { bindings::rust_sysbrk_abort(s) };
+            EINVAL.to_errno() as c_ulong
+        }
+    }
+}
+
+/// C ABI: sequence `process_madvise` after C imports the iovec and pidfd.
+///
+/// Sets `*handled` once classify has run. `vector_madvise` stays in C.
+/// Unknown kind after acquiring mm/task/iovec releases them.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_pmad_state` filled from the syscall args.
+/// `handled` must be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_pmad_dispatch(
+    s: *mut bindings::rust_pmad_state,
+    handled: *mut c_int,
+) -> isize {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as isize;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: isize = 0;
+    // SAFETY: `s` is live; classify may take a task/mm reference.
+    let kind = unsafe { bindings::rust_pmad_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_PMAD.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first process_madvise sequenced\n");
+    }
+
+    match kind {
+        PMAD_DONE => out,
+        // SAFETY: Resources held; walk then mmput/put_task/kfree.
+        PMAD_APPLY => unsafe { bindings::rust_pmad_apply(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown process_madvise kind {kind}\n");
+            // SAFETY: Drop task/mm/iovec acquired by classify.
+            unsafe { bindings::rust_pmad_abort(s) };
+            EINVAL.to_errno() as isize
+        }
+    }
 }

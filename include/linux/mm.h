@@ -4358,6 +4358,13 @@ int rust_brk_new(struct vma_iterator *vmi, struct vm_area_struct **vma,
 		 int *out);
 void rust_brk_account(struct vm_area_struct *vma, unsigned long len,
 		      vma_flags_t *vma_flags);
+struct rust_sysbrk_state;
+#define RUST_SYSBRK_DONE	0
+#define RUST_SYSBRK_EXIT	1
+unsigned long rust_sysbrk_dispatch(struct rust_sysbrk_state *s, int *handled);
+int rust_sysbrk_classify(struct rust_sysbrk_state *s, unsigned long *out);
+unsigned long rust_sysbrk_exit(struct rust_sysbrk_state *s);
+void rust_sysbrk_abort(struct rust_sysbrk_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;
@@ -4572,6 +4579,13 @@ int rust_mupd_dispatch(struct rust_mupd_state *s, int *handled);
 int rust_mupd_classify(struct rust_mupd_state *s, int *out);
 int rust_mupd_name(struct rust_mupd_state *s);
 int rust_mupd_flags(struct rust_mupd_state *s);
+struct rust_pmad_state;
+#define RUST_PMAD_DONE		0
+#define RUST_PMAD_APPLY		1
+ssize_t rust_pmad_dispatch(struct rust_pmad_state *s, int *handled);
+int rust_pmad_classify(struct rust_pmad_state *s, ssize_t *out);
+ssize_t rust_pmad_apply(struct rust_pmad_state *s);
+void rust_pmad_abort(struct rust_pmad_state *s);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

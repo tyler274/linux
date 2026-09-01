@@ -114,107 +114,6 @@ static int check_brk_limits(unsigned long addr, unsigned long len)
 	return mlock_future_ok(mm, is_def_locked, len) ? 0 : -EAGAIN;
 }
 
-SYSCALL_DEFINE1(brk, unsigned long, brk)
-{
-	unsigned long newbrk, oldbrk, origbrk;
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *brkvma, *next = NULL;
-	unsigned long min_brk;
-	bool populate = false;
-	LIST_HEAD(uf);
-	struct vma_iterator vmi;
-
-	if (mmap_write_lock_killable(mm))
-		return -EINTR;
-
-	origbrk = mm->brk;
-
-	min_brk = mm->start_brk;
-#ifdef CONFIG_COMPAT_BRK
-	/*
-	 * CONFIG_COMPAT_BRK can still be overridden by setting
-	 * randomize_va_space to 2, which will still cause mm->start_brk
-	 * to be arbitrarily shifted
-	 */
-	if (!current->brk_randomized)
-		min_brk = mm->end_data;
-#endif
-	if (brk < min_brk)
-		goto out;
-
-	/*
-	 * Check against rlimit here. If this check is done later after the test
-	 * of oldbrk with newbrk then it can escape the test and let the data
-	 * segment grow beyond its set limit the in case where the limit is
-	 * not page aligned -Ram Gupta
-	 */
-	if (check_data_rlimit(rlimit(RLIMIT_DATA), brk, mm->start_brk,
-			      mm->end_data, mm->start_data))
-		goto out;
-
-	newbrk = PAGE_ALIGN(brk);
-	oldbrk = PAGE_ALIGN(mm->brk);
-	if (oldbrk == newbrk) {
-		mm->brk = brk;
-		goto success;
-	}
-
-	/* Always allow shrinking brk. */
-	if (brk <= mm->brk) {
-		/* Search one past newbrk */
-		vma_iter_init(&vmi, mm, newbrk);
-		brkvma = vma_find(&vmi, oldbrk);
-		if (!brkvma || brkvma->vm_start >= oldbrk)
-			goto out; /* mapping intersects with an existing non-brk vma. */
-		/*
-		 * mm->brk must be protected by write mmap_lock.
-		 * do_vmi_align_munmap() will drop the lock on success,  so
-		 * update it before calling do_vma_munmap().
-		 */
-		mm->brk = brk;
-		if (do_vmi_align_munmap(&vmi, brkvma, mm, newbrk, oldbrk, &uf,
-					/* unlock = */ true))
-			goto out;
-
-		goto success_unlocked;
-	}
-
-	if (check_brk_limits(oldbrk, newbrk - oldbrk))
-		goto out;
-
-	/*
-	 * Only check if the next VMA is within the stack_guard_gap of the
-	 * expansion area
-	 */
-	vma_iter_init(&vmi, mm, oldbrk);
-	next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);
-	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
-		goto out;
-
-	brkvma = vma_prev_limit(&vmi, mm->start_brk);
-	/* Ok, looks good - let it rip. */
-	if (do_brk_flags(&vmi, brkvma, oldbrk, newbrk - oldbrk,
-			 EMPTY_VMA_FLAGS) < 0)
-		goto out;
-
-	mm->brk = brk;
-	if (vma_flags_test(&mm->def_vma_flags, VMA_LOCKED_BIT))
-		populate = true;
-
-success:
-	mmap_write_unlock(mm);
-success_unlocked:
-	userfaultfd_unmap_complete(mm, &uf);
-	if (populate)
-		mm_populate(oldbrk, newbrk - oldbrk);
-	return brk;
-
-out:
-	mm->brk = origbrk;
-	mmap_write_unlock(mm);
-	return origbrk;
-}
-
 /*
  * If a hint addr is less than mmap_min_addr change hint to be as
  * low as possible but still greater than mmap_min_addr
@@ -226,6 +125,189 @@ static inline unsigned long round_hint_to_min(unsigned long hint)
 	    (hint < mmap_min_addr))
 		return PAGE_ALIGN(mmap_min_addr);
 	return hint;
+}
+
+#define SYSBRK_DONE		0
+#define SYSBRK_EXIT		1
+
+struct rust_sysbrk_state {
+	unsigned long brk;
+	unsigned long origbrk;
+	unsigned long newbrk;
+	unsigned long oldbrk;
+	struct mm_struct *mm;
+	struct vm_area_struct *brkvma;
+	struct vm_area_struct *next;
+	struct vma_iterator vmi;
+	struct list_head uf;
+	bool populate;
+	bool locked;
+};
+
+static int sysbrk_classify(struct rust_sysbrk_state *s, unsigned long *out)
+{
+	unsigned long min_brk;
+	struct mm_struct *mm = current->mm;
+
+	s->mm = mm;
+	s->populate = false;
+	s->locked = false;
+	s->next = NULL;
+	INIT_LIST_HEAD(&s->uf);
+	*out = 0;
+
+	if (mmap_write_lock_killable(mm)) {
+		*out = -EINTR;
+		return SYSBRK_DONE;
+	}
+	s->locked = true;
+
+	s->origbrk = mm->brk;
+
+	min_brk = mm->start_brk;
+#ifdef CONFIG_COMPAT_BRK
+	/*
+	 * CONFIG_COMPAT_BRK can still be overridden by setting
+	 * randomize_va_space to 2, which will still cause mm->start_brk
+	 * to be arbitrarily shifted
+	 */
+	if (!current->brk_randomized)
+		min_brk = mm->end_data;
+#endif
+	if (s->brk < min_brk)
+		goto fail;
+
+	/*
+	 * Check against rlimit here. If this check is done later after the test
+	 * of oldbrk with newbrk then it can escape the test and let the data
+	 * segment grow beyond its set limit the in case where the limit is
+	 * not page aligned -Ram Gupta
+	 */
+	if (check_data_rlimit(rlimit(RLIMIT_DATA), s->brk, mm->start_brk,
+			      mm->end_data, mm->start_data))
+		goto fail;
+
+	s->newbrk = PAGE_ALIGN(s->brk);
+	s->oldbrk = PAGE_ALIGN(mm->brk);
+	if (s->oldbrk == s->newbrk) {
+		mm->brk = s->brk;
+		return SYSBRK_EXIT;
+	}
+
+	/* Always allow shrinking brk. */
+	if (s->brk <= mm->brk) {
+		/* Search one past newbrk */
+		vma_iter_init(&s->vmi, mm, s->newbrk);
+		s->brkvma = vma_find(&s->vmi, s->oldbrk);
+		if (!s->brkvma || s->brkvma->vm_start >= s->oldbrk)
+			goto fail; /* mapping intersects with an existing non-brk vma. */
+		/*
+		 * mm->brk must be protected by write mmap_lock.
+		 * do_vmi_align_munmap() will drop the lock on success,  so
+		 * update it before calling do_vma_munmap().
+		 */
+		mm->brk = s->brk;
+		if (do_vmi_align_munmap(&s->vmi, s->brkvma, mm, s->newbrk,
+					s->oldbrk, &s->uf,
+					/* unlock = */ true))
+			goto fail;
+
+		s->locked = false;
+		return SYSBRK_EXIT;
+	}
+
+	if (check_brk_limits(s->oldbrk, s->newbrk - s->oldbrk))
+		goto fail;
+
+	/*
+	 * Only check if the next VMA is within the stack_guard_gap of the
+	 * expansion area
+	 */
+	vma_iter_init(&s->vmi, mm, s->oldbrk);
+	s->next = vma_find(&s->vmi, s->newbrk + PAGE_SIZE + stack_guard_gap);
+	if (s->next && s->newbrk + PAGE_SIZE > vm_start_gap(s->next))
+		goto fail;
+
+	s->brkvma = vma_prev_limit(&s->vmi, mm->start_brk);
+	/* Ok, looks good - let it rip. */
+	if (do_brk_flags(&s->vmi, s->brkvma, s->oldbrk, s->newbrk - s->oldbrk,
+			 EMPTY_VMA_FLAGS) < 0)
+		goto fail;
+
+	mm->brk = s->brk;
+	if (vma_flags_test(&mm->def_vma_flags, VMA_LOCKED_BIT))
+		s->populate = true;
+
+	return SYSBRK_EXIT;
+
+fail:
+	mm->brk = s->origbrk;
+	mmap_write_unlock(mm);
+	s->locked = false;
+	*out = s->origbrk;
+	return SYSBRK_DONE;
+}
+
+static unsigned long sysbrk_exit(struct rust_sysbrk_state *s)
+{
+	if (s->locked)
+		mmap_write_unlock(s->mm);
+	s->locked = false;
+	userfaultfd_unmap_complete(s->mm, &s->uf);
+	if (s->populate)
+		mm_populate(s->oldbrk, s->newbrk - s->oldbrk);
+	return s->brk;
+}
+
+static void sysbrk_abort(struct rust_sysbrk_state *s)
+{
+	if (s->locked) {
+		s->mm->brk = s->origbrk;
+		mmap_write_unlock(s->mm);
+		s->locked = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_sysbrk_classify(struct rust_sysbrk_state *s, unsigned long *out)
+{
+	return sysbrk_classify(s, out);
+}
+
+unsigned long rust_sysbrk_exit(struct rust_sysbrk_state *s)
+{
+	return sysbrk_exit(s);
+}
+
+void rust_sysbrk_abort(struct rust_sysbrk_state *s)
+{
+	sysbrk_abort(s);
+}
+#endif
+
+static unsigned long finish_sysbrk(struct rust_sysbrk_state *s)
+{
+	unsigned long out = 0;
+
+	if (sysbrk_classify(s, &out) == SYSBRK_EXIT)
+		return sysbrk_exit(s);
+	return out;
+}
+
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+	struct rust_sysbrk_state s = {
+		.brk = brk,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	unsigned long rust_ret;
+
+	rust_ret = rust_sysbrk_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_sysbrk(&s);
 }
 
 bool mlock_future_ok(const struct mm_struct *mm, bool is_vma_locked,

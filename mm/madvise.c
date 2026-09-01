@@ -2544,51 +2544,93 @@ static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
 	return finish_vmadvise(&s);
 }
 
-SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
-		size_t, vlen, int, behavior, unsigned int, flags)
-{
-	ssize_t ret;
+#define PMAD_DONE		0
+#define PMAD_APPLY		1
+
+struct rust_pmad_state {
+	int pidfd;
+	const struct iovec __user *vec;
+	size_t vlen;
+	int behavior;
+	unsigned int flags;
 	struct iovec iovstack[UIO_FASTIOV];
-	struct iovec *iov = iovstack;
+	struct iovec *iov;
 	struct iov_iter iter;
 	struct task_struct *task;
 	struct mm_struct *mm;
+};
+
+static void pmad_release(struct rust_pmad_state *s)
+{
+	if (s->mm) {
+		mmput(s->mm);
+		s->mm = NULL;
+	}
+	if (s->task) {
+		put_task_struct(s->task);
+		s->task = NULL;
+	}
+	kfree(s->iov);
+	s->iov = NULL;
+}
+
+static int pmad_classify(struct rust_pmad_state *s, ssize_t *out)
+{
+	ssize_t ret;
 	unsigned int f_flags;
+	struct task_struct *task;
+	struct mm_struct *mm;
 
-	if (flags != 0) {
-		ret = -EINVAL;
-		goto out;
+	*out = 0;
+	s->iov = NULL;
+	s->task = NULL;
+	s->mm = NULL;
+
+	if (s->flags != 0) {
+		*out = -EINVAL;
+		return PMAD_DONE;
 	}
 
-	ret = import_iovec(ITER_DEST, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
-	if (ret < 0)
-		goto out;
+	s->iov = s->iovstack;
+	ret = import_iovec(ITER_DEST, s->vec, s->vlen, ARRAY_SIZE(s->iovstack),
+			   &s->iov, &s->iter);
+	if (ret < 0) {
+		*out = ret;
+		return PMAD_DONE;
+	}
 
-	task = pidfd_get_task(pidfd, &f_flags);
+	task = pidfd_get_task(s->pidfd, &f_flags);
 	if (IS_ERR(task)) {
-		ret = PTR_ERR(task);
-		goto free_iov;
+		*out = PTR_ERR(task);
+		kfree(s->iov);
+		s->iov = NULL;
+		return PMAD_DONE;
 	}
+	s->task = task;
 
 	/* Require PTRACE_MODE_READ to avoid leaking ASLR metadata. */
 	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
 	if (IS_ERR(mm)) {
-		ret = PTR_ERR(mm);
-		goto release_task;
+		*out = PTR_ERR(mm);
+		pmad_release(s);
+		return PMAD_DONE;
 	}
+	s->mm = mm;
 
-	if (!madvise_behavior_valid(behavior)) {
-		ret = -EINVAL;
-		goto release_mm;
+	if (!madvise_behavior_valid(s->behavior)) {
+		*out = -EINVAL;
+		pmad_release(s);
+		return PMAD_DONE;
 	}
 
 	/*
 	 * We need only perform this check if we are attempting to manipulate a
 	 * remote process's address space.
 	 */
-	if (mm != current->mm && !process_madvise_remote_valid(behavior)) {
-		ret = -EINVAL;
-		goto release_mm;
+	if (mm != current->mm && !process_madvise_remote_valid(s->behavior)) {
+		*out = -EINVAL;
+		pmad_release(s);
+		return PMAD_DONE;
 	}
 
 	/*
@@ -2597,20 +2639,68 @@ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
 	 * processes.
 	 */
 	if (mm != current->mm && !capable(CAP_SYS_NICE)) {
-		ret = -EPERM;
-		goto release_mm;
+		*out = -EPERM;
+		pmad_release(s);
+		return PMAD_DONE;
 	}
 
-	ret = vector_madvise(mm, &iter, behavior);
+	return PMAD_APPLY;
+}
 
-release_mm:
-	mmput(mm);
-release_task:
-	put_task_struct(task);
-free_iov:
-	kfree(iov);
-out:
+static ssize_t pmad_apply(struct rust_pmad_state *s)
+{
+	ssize_t ret;
+
+	ret = vector_madvise(s->mm, &s->iter, s->behavior);
+	pmad_release(s);
 	return ret;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_pmad_classify(struct rust_pmad_state *s, ssize_t *out)
+{
+	return pmad_classify(s, out);
+}
+
+ssize_t rust_pmad_apply(struct rust_pmad_state *s)
+{
+	return pmad_apply(s);
+}
+
+void rust_pmad_abort(struct rust_pmad_state *s)
+{
+	pmad_release(s);
+}
+#endif
+
+static ssize_t finish_pmad(struct rust_pmad_state *s)
+{
+	ssize_t out = 0;
+
+	if (pmad_classify(s, &out) == PMAD_APPLY)
+		return pmad_apply(s);
+	return out;
+}
+
+SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
+		size_t, vlen, int, behavior, unsigned int, flags)
+{
+	struct rust_pmad_state s = {
+		.pidfd = pidfd,
+		.vec = vec,
+		.vlen = vlen,
+		.behavior = behavior,
+		.flags = flags,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	ssize_t rust_ret;
+
+	rust_ret = rust_pmad_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_pmad(&s);
 }
 
 #ifdef CONFIG_ANON_VMA_NAME

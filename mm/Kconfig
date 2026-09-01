@@ -227,7 +227,9 @@ config RUST_MMAP
 	  flag update), madvise_dontneed_free (validate vs zap vs
 	  MADV_FREE), and madvise_update_vma (no-op vs name vs flags),
 	  vma_merge_new_range (no-merge vs expand), and __mmap_new_vma
-	  (file vs shmem vs maple-tree store). Maple-tree expand/store
+	  (file vs shmem vs maple-tree store), brk (shrink vs expand vs
+	  unlock/populate), and process_madvise (pidfd/iovec vs vector
+	  walk). Maple-tree expand/store
 	  and the new-VMA file mmap/shmem bodies stay in C.
 
 	  If unsure, say N.
