@@ -12,6 +12,7 @@
 #include <linux/gfp.h>
 #include <linux/pagewalk.h>
 #include <linux/mman.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/swap.h>
@@ -289,29 +290,59 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
  *		mapped
  *  -EAGAIN - A kernel resource was temporarily unavailable.
  */
-SYSCALL_DEFINE3(mincore, unsigned long, start, size_t, len,
-		unsigned char __user *, vec)
-{
-	long retval;
-	unsigned long pages;
-	unsigned char *tmp;
+#define MINCORE_DONE		0
+#define MINCORE_APPLY		1
 
-	start = untagged_addr(start);
+#ifndef CONFIG_RUST_MMAP
+struct rust_mincore_req {
+	unsigned long start;
+	size_t len;
+	unsigned char __user *vec;
+	unsigned long pages;
+};
+#endif
+
+static int mincore_validate(struct rust_mincore_req *req, int *out)
+{
+	unsigned long start;
+	unsigned long pages;
+
+	*out = 0;
+	start = untagged_addr(req->start);
 
 	/* Check the start address: needs to be page-aligned.. */
-	if (unlikely(start & ~PAGE_MASK))
-		return -EINVAL;
+	if (unlikely(start & ~PAGE_MASK)) {
+		*out = -EINVAL;
+		return MINCORE_DONE;
+	}
 
 	/* ..and we need to be passed a valid user-space range */
-	if (!access_ok((void __user *) start, len))
-		return -ENOMEM;
+	if (!access_ok((void __user *)start, req->len)) {
+		*out = -ENOMEM;
+		return MINCORE_DONE;
+	}
 
 	/* This also avoids any overflows on PAGE_ALIGN */
-	pages = len >> PAGE_SHIFT;
-	pages += (offset_in_page(len)) != 0;
+	pages = req->len >> PAGE_SHIFT;
+	pages += (offset_in_page(req->len)) != 0;
 
-	if (!access_ok(vec, pages))
-		return -EFAULT;
+	if (!access_ok(req->vec, pages)) {
+		*out = -EFAULT;
+		return MINCORE_DONE;
+	}
+
+	req->start = start;
+	req->pages = pages;
+	return MINCORE_APPLY;
+}
+
+static long mincore_apply(struct rust_mincore_req *req)
+{
+	unsigned long start = req->start;
+	unsigned long pages = req->pages;
+	unsigned char __user *vec = req->vec;
+	unsigned char *tmp;
+	long retval;
 
 	tmp = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!tmp)
@@ -340,4 +371,53 @@ SYSCALL_DEFINE3(mincore, unsigned long, start, size_t, len,
 	}
 	kfree(tmp);
 	return retval;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mincore_validate(struct rust_mincore_req *req, int *out)
+{
+	return mincore_validate(req, out);
+}
+
+long rust_mincore_apply(struct rust_mincore_req *req)
+{
+	return mincore_apply(req);
+}
+#endif
+
+static long finish_mincore(struct rust_mincore_req *req)
+{
+	int out = 0;
+	int kind;
+
+	kind = mincore_validate(req, &out);
+	if (kind == MINCORE_DONE)
+		return out;
+	return mincore_apply(req);
+}
+
+static long do_mincore_sys(unsigned long start, size_t len,
+			   unsigned char __user *vec)
+{
+	struct rust_mincore_req req = {
+		.start = start,
+		.len = len,
+		.vec = vec,
+	};
+
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	long rust_ret;
+
+	rust_ret = rust_mincore_dispatch(&req, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mincore(&req);
+}
+
+SYSCALL_DEFINE3(mincore, unsigned long, start, size_t, len,
+		unsigned char __user *, vec)
+{
+	return do_mincore_sys(start, len, vec);
 }

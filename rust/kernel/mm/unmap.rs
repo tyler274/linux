@@ -13,12 +13,15 @@
 //! `mseal` (validate vs lock/seal), `do_mlock` (prepare vs lock/apply vs
 //! populate), `mlock_fixup` (filter vs `vma_modify_flags` vs pages),
 //! mprotect VMA walk (lock/pkey/grows vs per-VMA `mprotect_fixup`),
-//! `munlock`, `mlockall`, and `munlockall`.
+//! `munlock`, `mlockall`, and `munlockall`, `msync` (validate vs VMA
+//! walk), `mincore` (validate vs residency walk), and
+//! `vector_madvise` (lock vs per-iov walk).
 //! Maple-tree storage and the merge / new-VMA / `change_protection` /
-//! page-table move / madvise VMA-walk / seal-range / mlock page-walk
-//! bodies stay in C. The mmap lock is already held by the C caller except
-//! for mprotect, mremap, madvise, mseal, mlock, munlock, mlockall, and
-//! munlockall, which take it in apply / lock.
+//! page-table move / madvise VMA-walk / seal-range / mlock page-walk /
+//! msync / mincore walk bodies stay in C. The mmap lock is already
+//! held by the C caller except for mprotect, mremap, madvise, mseal,
+//! mlock, munlock, mlockall, munlockall, msync, mincore, and
+//! vector_madvise, which take it in apply / lock.
 
 use crate::{
     bindings,
@@ -135,6 +138,21 @@ const MLOCKALL_CONT: i32 = 1;
 /// Applied with `MCL_CURRENT`; populate the address space.
 const MLOCKALL_POPULATE: i32 = 2;
 
+/// Matches `RUST_MSYNC_*` in `include/linux/mm.h`.
+const MSYNC_DONE: i32 = 0;
+/// Flags and range are valid; lock and walk VMAs.
+const MSYNC_APPLY: i32 = 1;
+
+/// Matches `RUST_MINCORE_*` in `include/linux/mm.h`.
+const MINCORE_DONE: i32 = 0;
+/// Range is valid; walk residency into the user vector.
+const MINCORE_APPLY: i32 = 1;
+
+/// Matches `RUST_VMADV_*` in `include/linux/mm.h`.
+const VMADV_DONE: i32 = 0;
+/// mmap lock taken; walk each iovec then unlock.
+const VMADV_WALK: i32 = 1;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
@@ -151,6 +169,9 @@ static N_MPWALK: Atomic<u32> = Atomic::new(0);
 static N_MUNLOCK: Atomic<u32> = Atomic::new(0);
 static N_MLOCKALL: Atomic<u32> = Atomic::new(0);
 static N_MUNLOCKALL: Atomic<u32> = Atomic::new(0);
+static N_MSYNC: Atomic<u32> = Atomic::new(0);
+static N_MINCORE: Atomic<u32> = Atomic::new(0);
+static N_VMADV: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -339,7 +360,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -1243,4 +1264,133 @@ pub unsafe extern "C" fn rust_munlockall_dispatch(handled: *mut c_int) -> c_int 
 
     // SAFETY: Apply takes and drops the mmap write lock.
     unsafe { bindings::rust_munlockall_apply() }
+}
+
+/// C ABI: sequence `msync` after C validates flags and alignment.
+///
+/// Sets `*handled` once validate has run. The mmap lock and VMA walk
+/// (including dropping the lock around `vfs_fsync_range`) stay in C.
+///
+/// # Safety
+///
+/// `req` must be a live request filled by `do_msync`. `handled` must
+/// be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_msync_dispatch(
+    req: *mut bindings::rust_msync_req,
+    handled: *mut c_int,
+) -> c_int {
+    if req.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `req` holds the syscall arguments.
+    let kind = unsafe { bindings::rust_msync_validate(req, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MSYNC.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first msync sequenced\n");
+    }
+
+    match kind {
+        MSYNC_DONE => out,
+        // SAFETY: Range is valid; apply takes the mmap read lock.
+        MSYNC_APPLY => unsafe { bindings::rust_msync_apply(req) },
+        _ => {
+            pr_err!("rust-mmap: unknown msync kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `mincore` after C validates alignment and access.
+///
+/// Sets `*handled` once validate has run. The mmap lock, page-table
+/// residency walk, and `copy_to_user` stay in C.
+///
+/// # Safety
+///
+/// `req` must be a live request filled by `do_mincore_sys`. `handled`
+/// must be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mincore_dispatch(
+    req: *mut bindings::rust_mincore_req,
+    handled: *mut c_int,
+) -> c_long {
+    if req.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_long;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `req` holds the syscall arguments.
+    let kind = unsafe { bindings::rust_mincore_validate(req, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MINCORE.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mincore sequenced\n");
+    }
+
+    match kind {
+        MINCORE_DONE => out as c_long,
+        // SAFETY: Range is valid; apply walks under the mmap read lock.
+        MINCORE_APPLY => unsafe { bindings::rust_mincore_apply(req) },
+        _ => {
+            pr_err!("rust-mmap: unknown mincore kind {kind}\n");
+            EINVAL.to_errno() as c_long
+        }
+    }
+}
+
+/// C ABI: sequence `vector_madvise` after C takes the madvise lock.
+///
+/// Sets `*handled` once lock/init-tlb has run. Lock-fail returns
+/// without walking. The per-iov `madvise_do_behavior` body stays in C.
+///
+/// # Safety
+///
+/// `s` must be live stack state from `vector_madvise`. `handled` must
+/// be a valid out-parameter. No mmap lock is held on entry.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vmadvise_dispatch(
+    s: *mut bindings::rust_vmadvise_state,
+    handled: *mut c_int,
+) -> isize {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as isize;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `s` holds mm, iov, and behavior.
+    let kind = unsafe { bindings::rust_vmadvise_lock(s, &mut out) };
+    // SAFETY: `handled` is valid. Lock-fail never took the lock.
+    unsafe { *handled = 1 };
+
+    let prev = N_VMADV.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vector_madvise sequenced\n");
+    }
+
+    if kind == VMADV_DONE {
+        return out as isize;
+    }
+    if kind != VMADV_WALK {
+        pr_err!("rust-mmap: unknown vector_madvise lock kind {kind}\n");
+        // SAFETY: Unexpected kind after a successful lock; drop tlb/lock.
+        unsafe { bindings::rust_vmadvise_abort(s) };
+        return EINVAL.to_errno() as isize;
+    }
+
+    // SAFETY: Lock held and tlb initialized; walk iovecs then unlock.
+    unsafe { bindings::rust_vmadvise_walk(s) }
 }

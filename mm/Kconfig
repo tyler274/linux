@@ -219,7 +219,9 @@ config RUST_MMAP
 	  (validate vs lock/seal), do_mlock (prepare vs lock/apply vs
 	  populate), mlock_fixup (filter vs vma_modify_flags vs pages),
 	  mprotect VMA walk (lock/pkey/grows vs per-VMA fixup), munlock,
-	  mlockall, and munlockall. Maple-tree VMA storage and the
+	  mlockall, munlockall, msync (validate vs VMA walk), mincore
+	  (validate vs residency walk), and process_madvise's vector
+	  walk (lock vs per-iov). Maple-tree VMA storage and the
 	  merge/new-VMA bodies stay in C.
 
 	  If unsure, say N.

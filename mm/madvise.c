@@ -2066,24 +2066,41 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 }
 
 /* Perform an madvise operation over a vector of addresses and lengths. */
-static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
-			      int behavior)
-{
-	ssize_t ret = 0;
+#define VMADV_DONE		0
+#define VMADV_WALK		1
+
+struct rust_vmadvise_state {
+	struct mm_struct *mm;
+	struct iov_iter *iter;
+	int behavior;
 	size_t total_len;
 	struct mmu_gather tlb;
-	struct madvise_behavior madv_behavior = {
-		.mm = mm,
-		.behavior = behavior,
-		.tlb = &tlb,
-	};
+	struct madvise_behavior madv;
+};
 
-	total_len = iov_iter_count(iter);
+static int vmadvise_lock(struct rust_vmadvise_state *s, int *out)
+{
+	int ret;
 
-	ret = madvise_lock(&madv_behavior);
-	if (ret)
-		return ret;
-	madvise_init_tlb(&madv_behavior);
+	*out = 0;
+	s->total_len = iov_iter_count(s->iter);
+	s->madv.mm = s->mm;
+	s->madv.behavior = s->behavior;
+	s->madv.tlb = &s->tlb;
+
+	ret = madvise_lock(&s->madv);
+	if (ret) {
+		*out = ret;
+		return VMADV_DONE;
+	}
+	madvise_init_tlb(&s->madv);
+	return VMADV_WALK;
+}
+
+static ssize_t vmadvise_walk(struct rust_vmadvise_state *s)
+{
+	ssize_t ret = 0;
+	struct iov_iter *iter = s->iter;
 
 	while (iov_iter_count(iter)) {
 		unsigned long start = (unsigned long)iter_iov_addr(iter);
@@ -2094,7 +2111,7 @@ static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
 		if (error || !len_in)
 			ret = error;
 		else
-			ret = madvise_do_behavior(start, len_in, &madv_behavior);
+			ret = madvise_do_behavior(start, len_in, &s->madv);
 		/*
 		 * An madvise operation is attempting to restart the syscall,
 		 * but we cannot proceed as it would not be correct to repeat
@@ -2112,25 +2129,79 @@ static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
 			}
 
 			/* Drop and reacquire lock to unwind race. */
-			madvise_finish_tlb(&madv_behavior);
-			madvise_unlock(&madv_behavior);
-			ret = madvise_lock(&madv_behavior);
+			madvise_finish_tlb(&s->madv);
+			madvise_unlock(&s->madv);
+			ret = madvise_lock(&s->madv);
 			if (ret)
 				goto out;
-			madvise_init_tlb(&madv_behavior);
+			madvise_init_tlb(&s->madv);
 			continue;
 		}
 		if (ret < 0)
 			break;
 		iov_iter_advance(iter, iter_iov_len(iter));
 	}
-	madvise_finish_tlb(&madv_behavior);
-	madvise_unlock(&madv_behavior);
+	madvise_finish_tlb(&s->madv);
+	madvise_unlock(&s->madv);
 
 out:
-	ret = (total_len - iov_iter_count(iter)) ? : ret;
+	ret = (s->total_len - iov_iter_count(iter)) ? : ret;
 
 	return ret;
+}
+
+static void vmadvise_abort(struct rust_vmadvise_state *s)
+{
+	madvise_finish_tlb(&s->madv);
+	madvise_unlock(&s->madv);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vmadvise_lock(struct rust_vmadvise_state *s, int *out)
+{
+	return vmadvise_lock(s, out);
+}
+
+ssize_t rust_vmadvise_walk(struct rust_vmadvise_state *s)
+{
+	return vmadvise_walk(s);
+}
+
+void rust_vmadvise_abort(struct rust_vmadvise_state *s)
+{
+	vmadvise_abort(s);
+}
+#endif
+
+static ssize_t finish_vmadvise(struct rust_vmadvise_state *s)
+{
+	int out = 0;
+	int kind;
+
+	kind = vmadvise_lock(s, &out);
+	if (kind == VMADV_DONE)
+		return out;
+	return vmadvise_walk(s);
+}
+
+static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
+			      int behavior)
+{
+	struct rust_vmadvise_state s = {
+		.mm = mm,
+		.iter = iter,
+		.behavior = behavior,
+	};
+
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	ssize_t rust_ret;
+
+	rust_ret = rust_vmadvise_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vmadvise(&s);
 }
 
 SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,

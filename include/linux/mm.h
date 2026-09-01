@@ -4487,6 +4487,35 @@ int rust_mlockall_apply(int flags, int *out);
 void rust_mlockall_populate(void);
 int rust_munlockall_dispatch(int *handled);
 int rust_munlockall_apply(void);
+struct rust_msync_req {
+	unsigned long start;
+	size_t len;
+	int flags;
+	unsigned long end;
+};
+#define RUST_MSYNC_DONE		0
+#define RUST_MSYNC_APPLY	1
+int rust_msync_dispatch(struct rust_msync_req *req, int *handled);
+int rust_msync_validate(struct rust_msync_req *req, int *out);
+int rust_msync_apply(struct rust_msync_req *req);
+struct rust_mincore_req {
+	unsigned long start;
+	size_t len;
+	unsigned char __user *vec;
+	unsigned long pages;
+};
+#define RUST_MINCORE_DONE	0
+#define RUST_MINCORE_APPLY	1
+long rust_mincore_dispatch(struct rust_mincore_req *req, int *handled);
+int rust_mincore_validate(struct rust_mincore_req *req, int *out);
+long rust_mincore_apply(struct rust_mincore_req *req);
+struct rust_vmadvise_state;
+#define RUST_VMADV_DONE		0
+#define RUST_VMADV_WALK		1
+ssize_t rust_vmadvise_dispatch(struct rust_vmadvise_state *s, int *handled);
+int rust_vmadvise_lock(struct rust_vmadvise_state *s, int *out);
+ssize_t rust_vmadvise_walk(struct rust_vmadvise_state *s);
+void rust_vmadvise_abort(struct rust_vmadvise_state *s);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

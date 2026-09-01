@@ -30,30 +30,60 @@
  * So by _not_ starting I/O in MS_ASYNC we provide complete flexibility to
  * applications.
  */
-SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
-{
+#define MSYNC_DONE		0
+#define MSYNC_APPLY		1
+
+#ifndef CONFIG_RUST_MMAP
+struct rust_msync_req {
+	unsigned long start;
+	size_t len;
+	int flags;
 	unsigned long end;
+};
+#endif
+
+static int msync_validate(struct rust_msync_req *req, int *out)
+{
+	unsigned long start;
+	size_t len;
+	unsigned long end;
+	int flags = req->flags;
+
+	*out = -EINVAL;
+	start = untagged_addr(req->start);
+	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
+		return MSYNC_DONE;
+	if (offset_in_page(start))
+		return MSYNC_DONE;
+	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
+		return MSYNC_DONE;
+
+	*out = -ENOMEM;
+	len = (req->len + ~PAGE_MASK) & PAGE_MASK;
+	end = start + len;
+	if (end < start)
+		return MSYNC_DONE;
+
+	*out = 0;
+	if (end == start)
+		return MSYNC_DONE;
+
+	req->start = start;
+	req->len = len;
+	req->end = end;
+	return MSYNC_APPLY;
+}
+
+static int msync_apply(struct rust_msync_req *req)
+{
+	unsigned long start = req->start;
+	unsigned long end = req->end;
+	int flags = req->flags;
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
 	int unmapped_error = 0;
-	int error = -EINVAL;
+	int error = 0;
 
-	start = untagged_addr(start);
-
-	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
-		goto out;
-	if (offset_in_page(start))
-		goto out;
-	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
-		goto out;
-	error = -ENOMEM;
-	len = (len + ~PAGE_MASK) & PAGE_MASK;
-	end = start + len;
-	if (end < start)
-		goto out;
-	error = 0;
-	if (end == start)
-		goto out;
 	/*
 	 * If the interval [start,end) covers some unmapped address ranges,
 	 * just ignore them, but return -ENOMEM at the end. Besides, if the
@@ -111,4 +141,51 @@ out_unlock:
 	mmap_read_unlock(mm);
 out:
 	return error ? : unmapped_error;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_msync_validate(struct rust_msync_req *req, int *out)
+{
+	return msync_validate(req, out);
+}
+
+int rust_msync_apply(struct rust_msync_req *req)
+{
+	return msync_apply(req);
+}
+#endif
+
+static int finish_msync(struct rust_msync_req *req)
+{
+	int out = 0;
+	int kind;
+
+	kind = msync_validate(req, &out);
+	if (kind == MSYNC_DONE)
+		return out;
+	return msync_apply(req);
+}
+
+static int do_msync(unsigned long start, size_t len, int flags)
+{
+	struct rust_msync_req req = {
+		.start = start,
+		.len = len,
+		.flags = flags,
+	};
+
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_msync_dispatch(&req, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_msync(&req);
+}
+
+SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
+{
+	return do_msync(start, len, flags);
 }
