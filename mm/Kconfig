@@ -213,9 +213,10 @@ config RUST_MMAP
 	  mmap_region (MDWE/writable vs merge vs new VMA vs complete),
 	  do_vmi_munmap (range check vs maple-tree unmap), do_brk_flags
 	  (expand vs new anonymous VMA), do_mprotect_pkey (validate vs
-	  VMA walk), do_mremap (move vs mremap_to vs mremap_at), and
-	  do_madvise (validate vs lock/walk). Maple-tree VMA storage
-	  and the merge/new-VMA bodies stay in C.
+	  VMA walk), mprotect_fixup (prepare vs vma_modify_flags vs
+	  change_protection), do_mremap (move vs mremap_to vs
+	  mremap_at), and do_madvise (validate vs lock/walk). Maple-tree
+	  VMA storage and the merge/new-VMA bodies stay in C.
 
 	  If unsure, say N.
 

@@ -4428,6 +4428,14 @@ unsigned long rust_mmapreg_complete(struct mmap_state *map,
 				    int have_mmap_prepare, int allocated_new);
 void rust_mmapreg_abort(struct mmap_state *map);
 void rust_mmapreg_unacct_abort(struct mmap_state *map);
+struct rust_mpfix_state;
+#define RUST_MPFIX_DONE		0
+#define RUST_MPFIX_MODIFY	1
+#define RUST_MPFIX_APPLY	2
+int rust_mpfix_dispatch(struct rust_mpfix_state *s, int *handled);
+int rust_mpfix_prepare(struct rust_mpfix_state *s, int *out);
+int rust_mpfix_modify(struct rust_mpfix_state *s, int *out);
+int rust_mpfix_apply(struct rust_mpfix_state *s);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

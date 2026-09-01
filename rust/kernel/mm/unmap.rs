@@ -7,9 +7,10 @@
 //! sequences `do_mmap` (prepare vs `mmap_region`), `mmap_region` (MDWE /
 //! writable vs merge vs new VMA vs complete), `do_vmi_munmap` (range
 //! check vs maple-tree unmap), `do_brk_flags` (expand vs new anonymous VMA),
-//! `do_mprotect_pkey` (validate vs VMA walk), `do_mremap` (move vs
+//! `do_mprotect_pkey` (validate vs VMA walk), `mprotect_fixup` (prepare vs
+//! `vma_modify_flags` vs `change_protection`), `do_mremap` (move vs
 //! `mremap_to` vs `mremap_at`), and `do_madvise` (validate vs lock/walk).
-//! Maple-tree storage and the merge / new-VMA / `mprotect_fixup` /
+//! Maple-tree storage and the merge / new-VMA / `change_protection` /
 //! page-table move / madvise VMA-walk bodies stay in C. The mmap lock is
 //! already held by the C caller except for mprotect, mremap, and madvise,
 //! which take it in apply / lock.
@@ -84,6 +85,13 @@ const MMAPREG_NEW: i32 = 3;
 /// Have a VMA; complete accounting and unmap.
 const MMAPREG_COMPLETE: i32 = 4;
 
+/// Matches `RUST_MPFIX_*` in `include/linux/mm.h`.
+const MPFIX_DONE: i32 = 0;
+/// Charge and flag checks passed; split/merge via `vma_modify_flags`.
+const MPFIX_MODIFY: i32 = 1;
+/// VMA updated; apply protection and accounting.
+const MPFIX_APPLY: i32 = 2;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
@@ -91,6 +99,7 @@ static N_MPROTECT: Atomic<u32> = Atomic::new(0);
 static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
 static N_MMAPREG: Atomic<u32> = Atomic::new(0);
+static N_MPFIX: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -279,7 +288,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -810,4 +819,58 @@ pub unsafe extern "C" fn rust_mmapreg_inner_dispatch(
     unsafe {
         bindings::rust_mmapreg_complete(map, vma, desc, have_mmap_prepare, allocated)
     }
+}
+
+/// C ABI: sequence `mprotect_fixup` after C checks seal, flags, and charge.
+///
+/// Sets `*handled` once prepare has run. Maple-tree split/merge stays
+/// in `vma_modify_flags`; PTE updates stay in `change_protection`.
+///
+/// # Safety
+///
+/// mmap write lock held as for `mprotect_fixup`. `s` must be the live
+/// state filled by `mprotect_fixup`. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mpfix_dispatch(
+    s: *mut bindings::rust_mpfix_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: mmap write lock held; `s` holds the VMA range and new flags.
+    let kind = unsafe { bindings::rust_mpfix_prepare(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MPFIX.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mprotect_fixup sequenced\n");
+    }
+
+    if kind == MPFIX_DONE {
+        return out;
+    }
+    if kind != MPFIX_MODIFY {
+        pr_err!("rust-mmap: unknown mprotect_fixup prepare kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: Charge/flags passed; split or merge the VMA.
+    let kind = unsafe { bindings::rust_mpfix_modify(s, &mut out) };
+    if kind == MPFIX_DONE {
+        return out;
+    }
+    if kind != MPFIX_APPLY {
+        pr_err!("rust-mmap: unknown mprotect_fixup modify kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: `s->vma` is the live mapping after modify.
+    unsafe { bindings::rust_mpfix_apply(s) }
 }

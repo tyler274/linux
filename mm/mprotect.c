@@ -756,25 +756,44 @@ static const struct mm_walk_ops prot_none_walk_ops = {
 	.walk_lock		= PGWALK_WRLOCK,
 };
 
-int
-mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
-	       struct vm_area_struct *vma, struct vm_area_struct **pprev,
-	       unsigned long start, unsigned long end, vm_flags_t newflags)
+#define MPFIX_DONE		0
+#define MPFIX_MODIFY		1
+#define MPFIX_APPLY		2
+
+struct rust_mpfix_state {
+	struct vma_iterator *vmi;
+	struct mmu_gather *tlb;
+	struct vm_area_struct *vma;
+	struct vm_area_struct **pprev;
+	unsigned long start;
+	unsigned long end;
+	vm_flags_t newflags;
+	vma_flags_t old_vma_flags;
+	vma_flags_t new_vma_flags;
+	unsigned long charged;
+	long nrpages;
+};
+
+static int mpfix_prepare(struct rust_mpfix_state *s, int *out)
 {
+	struct vm_area_struct *vma = s->vma;
 	struct mm_struct *mm = vma->vm_mm;
-	const vma_flags_t old_vma_flags = READ_ONCE(vma->flags);
-	vma_flags_t new_vma_flags = legacy_to_vma_flags(newflags);
-	long nrpages = (end - start) >> PAGE_SHIFT;
-	unsigned int mm_cp_flags = 0;
-	unsigned long charged = 0;
 	int error;
 
-	if (vma_is_sealed(vma))
-		return -EPERM;
+	*out = 0;
+	s->charged = 0;
+	s->old_vma_flags = READ_ONCE(vma->flags);
+	s->new_vma_flags = legacy_to_vma_flags(s->newflags);
+	s->nrpages = (s->end - s->start) >> PAGE_SHIFT;
 
-	if (vma_flags_same_pair(&old_vma_flags, &new_vma_flags)) {
-		*pprev = vma;
-		return 0;
+	if (vma_is_sealed(vma)) {
+		*out = -EPERM;
+		return MPFIX_DONE;
+	}
+
+	if (vma_flags_same_pair(&s->old_vma_flags, &s->new_vma_flags)) {
+		*s->pprev = vma;
+		return MPFIX_DONE;
 	}
 
 	/*
@@ -783,15 +802,17 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	 * uncommon case, so doesn't need to be very optimized.
 	 */
 	if (arch_has_pfn_modify_check() &&
-	    vma_flags_test_any(&old_vma_flags, VMA_PFNMAP_BIT,
+	    vma_flags_test_any(&s->old_vma_flags, VMA_PFNMAP_BIT,
 			       VMA_MIXEDMAP_BIT) &&
-	    !vma_flags_test_any_mask(&new_vma_flags, VMA_ACCESS_FLAGS)) {
-		pgprot_t new_pgprot = vm_get_page_prot(newflags);
+	    !vma_flags_test_any_mask(&s->new_vma_flags, VMA_ACCESS_FLAGS)) {
+		pgprot_t new_pgprot = vm_get_page_prot(s->newflags);
 
-		error = walk_page_range_vma(vma, start, end,
+		error = walk_page_range_vma(vma, s->start, s->end,
 				&prot_none_walk_ops, &new_pgprot);
-		if (error)
-			return error;
+		if (error) {
+			*out = error;
+			return MPFIX_DONE;
+		}
 	}
 
 	/*
@@ -803,66 +824,142 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	 * hugetlb mapping were accounted for even if read-only so there is
 	 * no need to account for them here.
 	 */
-	if (vma_flags_test(&new_vma_flags, VMA_WRITE_BIT)) {
+	if (vma_flags_test(&s->new_vma_flags, VMA_WRITE_BIT)) {
 		/* Check space limits when area turns into data. */
-		if (!may_expand_vm(mm, &new_vma_flags, nrpages) &&
-		    may_expand_vm(mm, &old_vma_flags, nrpages))
-			return -ENOMEM;
-		if (!vma_flags_test_any(&old_vma_flags,
+		if (!may_expand_vm(mm, &s->new_vma_flags, s->nrpages) &&
+		    may_expand_vm(mm, &s->old_vma_flags, s->nrpages)) {
+			*out = -ENOMEM;
+			return MPFIX_DONE;
+		}
+		if (!vma_flags_test_any(&s->old_vma_flags,
 				VMA_ACCOUNT_BIT, VMA_WRITE_BIT, VMA_HUGETLB_BIT,
 				VMA_SHARED_BIT, VMA_NORESERVE_BIT)) {
-			charged = nrpages;
-			if (security_vm_enough_memory_mm(mm, charged))
-				return -ENOMEM;
-			vma_flags_set(&new_vma_flags, VMA_ACCOUNT_BIT);
+			s->charged = s->nrpages;
+			if (security_vm_enough_memory_mm(mm, s->charged)) {
+				*out = -ENOMEM;
+				return MPFIX_DONE;
+			}
+			vma_flags_set(&s->new_vma_flags, VMA_ACCOUNT_BIT);
 		}
-	} else if (vma_flags_test(&old_vma_flags, VMA_ACCOUNT_BIT) &&
+	} else if (vma_flags_test(&s->old_vma_flags, VMA_ACCOUNT_BIT) &&
 		   vma_is_anonymous(vma) && !vma->anon_vma) {
-		vma_flags_clear(&new_vma_flags, VMA_ACCOUNT_BIT);
+		vma_flags_clear(&s->new_vma_flags, VMA_ACCOUNT_BIT);
 	}
 
-	vma = vma_modify_flags(vmi, *pprev, vma, start, end, &new_vma_flags);
+	return MPFIX_MODIFY;
+}
+
+static int mpfix_modify(struct rust_mpfix_state *s, int *out)
+{
+	struct vm_area_struct *vma;
+
+	*out = 0;
+	vma = vma_modify_flags(s->vmi, *s->pprev, s->vma, s->start, s->end,
+			       &s->new_vma_flags);
 	if (IS_ERR(vma)) {
-		error = PTR_ERR(vma);
-		goto fail;
+		vm_unacct_memory(s->charged);
+		*out = PTR_ERR(vma);
+		return MPFIX_DONE;
 	}
+	s->vma = vma;
+	*s->pprev = vma;
+	return MPFIX_APPLY;
+}
 
-	*pprev = vma;
+static int mpfix_apply(struct rust_mpfix_state *s)
+{
+	struct vm_area_struct *vma = s->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned int mm_cp_flags = 0;
+	vm_flags_t newflags;
 
 	/*
 	 * vm_flags and vm_page_prot are protected by the mmap_lock
 	 * held in write mode.
 	 */
 	vma_start_write(vma);
-	vma_flags_reset_once(vma, &new_vma_flags);
+	vma_flags_reset_once(vma, &s->new_vma_flags);
 	if (vma_wants_manual_pte_write_upgrade(vma))
 		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
 	vma_set_page_prot(vma);
 
-	change_protection(tlb, vma, start, end, mm_cp_flags);
+	change_protection(s->tlb, vma, s->start, s->end, mm_cp_flags);
 
-	if (vma_flags_test(&old_vma_flags, VMA_ACCOUNT_BIT) &&
-	    !vma_flags_test(&new_vma_flags, VMA_ACCOUNT_BIT))
-		vm_unacct_memory(nrpages);
+	if (vma_flags_test(&s->old_vma_flags, VMA_ACCOUNT_BIT) &&
+	    !vma_flags_test(&s->new_vma_flags, VMA_ACCOUNT_BIT))
+		vm_unacct_memory(s->nrpages);
 
 	/*
 	 * Private VMA_LOCKED_BIT VMA becoming writable: trigger COW to avoid
 	 * major fault on access.
 	 */
-	if (vma_flags_test(&new_vma_flags, VMA_WRITE_BIT) &&
-	    vma_flags_test(&old_vma_flags, VMA_LOCKED_BIT) &&
-	    !vma_flags_test_any(&old_vma_flags, VMA_WRITE_BIT, VMA_SHARED_BIT))
-		populate_vma_page_range(vma, start, end, NULL);
+	if (vma_flags_test(&s->new_vma_flags, VMA_WRITE_BIT) &&
+	    vma_flags_test(&s->old_vma_flags, VMA_LOCKED_BIT) &&
+	    !vma_flags_test_any(&s->old_vma_flags, VMA_WRITE_BIT, VMA_SHARED_BIT))
+		populate_vma_page_range(vma, s->start, s->end, NULL);
 
-	vm_stat_account(mm, vma_flags_to_legacy(old_vma_flags), -nrpages);
-	newflags = vma_flags_to_legacy(new_vma_flags);
-	vm_stat_account(mm, newflags, nrpages);
+	vm_stat_account(mm, vma_flags_to_legacy(s->old_vma_flags), -s->nrpages);
+	newflags = vma_flags_to_legacy(s->new_vma_flags);
+	vm_stat_account(mm, newflags, s->nrpages);
 	perf_event_mmap(vma);
 	return 0;
+}
 
-fail:
-	vm_unacct_memory(charged);
-	return error;
+static int finish_mpfix(struct rust_mpfix_state *s)
+{
+	int out = 0;
+	int kind;
+
+	kind = mpfix_prepare(s, &out);
+	if (kind == MPFIX_DONE)
+		return out;
+	kind = mpfix_modify(s, &out);
+	if (kind == MPFIX_DONE)
+		return out;
+	return mpfix_apply(s);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mpfix_prepare(struct rust_mpfix_state *s, int *out)
+{
+	return mpfix_prepare(s, out);
+}
+
+int rust_mpfix_modify(struct rust_mpfix_state *s, int *out)
+{
+	return mpfix_modify(s, out);
+}
+
+int rust_mpfix_apply(struct rust_mpfix_state *s)
+{
+	return mpfix_apply(s);
+}
+#endif
+
+int
+mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
+	       struct vm_area_struct *vma, struct vm_area_struct **pprev,
+	       unsigned long start, unsigned long end, vm_flags_t newflags)
+{
+	struct rust_mpfix_state s = {
+		.vmi = vmi,
+		.tlb = tlb,
+		.vma = vma,
+		.pprev = pprev,
+		.start = start,
+		.end = end,
+		.newflags = newflags,
+	};
+
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mpfix_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mpfix(&s);
 }
 
 /*
