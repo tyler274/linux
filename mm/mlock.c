@@ -455,6 +455,121 @@ static void mlock_vma_pages_range(struct vm_area_struct *vma,
 	}
 }
 
+#define MLFIX_DONE		0
+#define MLFIX_MODIFY		1
+#define MLFIX_PAGES		2
+
+struct rust_mlfix_state {
+	struct vma_iterator *vmi;
+	struct vm_area_struct *vma;
+	struct vm_area_struct **prev;
+	unsigned long start;
+	unsigned long end;
+	vma_flags_t *new_vma_flags;
+	vma_flags_t old_vma_flags;
+};
+
+static int mlfix_prepare(struct rust_mlfix_state *s, int *out)
+{
+	struct vm_area_struct *vma = s->vma;
+
+	*out = 0;
+	s->old_vma_flags = vma->flags;
+
+	if (vma_flags_same_pair(&s->old_vma_flags, s->new_vma_flags) ||
+	    vma_is_secretmem(vma) || !vma_supports_mlock(vma)) {
+		/*
+		 * Don't set VMA_LOCKED_BIT or VMA_LOCKONFAULT_BIT and don't
+		 * count.  For secretmem, don't allow the memory to be unlocked.
+		 */
+		*s->prev = vma;
+		return MLFIX_DONE;
+	}
+
+	return MLFIX_MODIFY;
+}
+
+static int mlfix_modify(struct rust_mlfix_state *s, int *out)
+{
+	struct vm_area_struct *vma;
+
+	vma = vma_modify_flags(s->vmi, *s->prev, s->vma, s->start, s->end,
+			       s->new_vma_flags);
+	if (IS_ERR(vma)) {
+		*s->prev = vma;
+		*out = PTR_ERR(vma);
+		return MLFIX_DONE;
+	}
+
+	s->vma = vma;
+	return MLFIX_PAGES;
+}
+
+static int mlfix_pages(struct rust_mlfix_state *s)
+{
+	struct vm_area_struct *vma = s->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	int nr_pages;
+
+	/*
+	 * Keep track of amount of locked VM.
+	 */
+	nr_pages = (s->end - s->start) >> PAGE_SHIFT;
+	if (!vma_flags_test(s->new_vma_flags, VMA_LOCKED_BIT))
+		nr_pages = -nr_pages;
+	else if (vma_flags_test(&s->old_vma_flags, VMA_LOCKED_BIT))
+		nr_pages = 0;
+	mm->locked_vm += nr_pages;
+
+	/*
+	 * vm_flags is protected by the mmap_lock held in write mode.
+	 * It's okay if try_to_unmap_one unmaps a page just after we
+	 * set VMA_LOCKED_BIT, populate_vma_page_range will bring it back.
+	 */
+	if (vma_flags_test(s->new_vma_flags, VMA_LOCKED_BIT) &&
+	    vma_flags_test(&s->old_vma_flags, VMA_LOCKED_BIT)) {
+		/* No work to do, and mlocking twice would be wrong */
+		vma_start_write(vma);
+		vma->flags = *s->new_vma_flags;
+	} else {
+		mlock_vma_pages_range(vma, s->start, s->end, s->new_vma_flags);
+	}
+
+	*s->prev = vma;
+	return 0;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mlfix_prepare(struct rust_mlfix_state *s, int *out)
+{
+	return mlfix_prepare(s, out);
+}
+
+int rust_mlfix_modify(struct rust_mlfix_state *s, int *out)
+{
+	return mlfix_modify(s, out);
+}
+
+int rust_mlfix_pages(struct rust_mlfix_state *s)
+{
+	return mlfix_pages(s);
+}
+#endif
+
+static int finish_mlfix(struct rust_mlfix_state *s)
+{
+	int out = 0;
+	int kind;
+
+	kind = mlfix_prepare(s, &out);
+	if (kind == MLFIX_DONE)
+		return out;
+	kind = mlfix_modify(s, &out);
+	if (kind == MLFIX_DONE)
+		return out;
+	return mlfix_pages(s);
+}
+
 /*
  * mlock_fixup  - handle mlock[all]/munlock[all] requests.
  *
@@ -468,52 +583,24 @@ static int mlock_fixup(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	       struct vm_area_struct **prev, unsigned long start,
 	       unsigned long end, vma_flags_t *new_vma_flags)
 {
-	const vma_flags_t old_vma_flags = vma->flags;
-	struct mm_struct *mm = vma->vm_mm;
-	int nr_pages;
-	int ret = 0;
+	struct rust_mlfix_state s = {
+		.vmi = vmi,
+		.vma = vma,
+		.prev = prev,
+		.start = start,
+		.end = end,
+		.new_vma_flags = new_vma_flags,
+	};
 
-	if (vma_flags_same_pair(&old_vma_flags, new_vma_flags) ||
-	    vma_is_secretmem(vma) || !vma_supports_mlock(vma)) {
-		/*
-		 * Don't set VMA_LOCKED_BIT or VMA_LOCKONFAULT_BIT and don't
-		 * count.  For secretmem, don't allow the memory to be unlocked.
-		 */
-		goto out;
-	}
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
 
-	vma = vma_modify_flags(vmi, *prev, vma, start, end, new_vma_flags);
-	if (IS_ERR(vma)) {
-		ret = PTR_ERR(vma);
-		goto out;
-	}
-
-	/*
-	 * Keep track of amount of locked VM.
-	 */
-	nr_pages = (end - start) >> PAGE_SHIFT;
-	if (!vma_flags_test(new_vma_flags, VMA_LOCKED_BIT))
-		nr_pages = -nr_pages;
-	else if (vma_flags_test(&old_vma_flags, VMA_LOCKED_BIT))
-		nr_pages = 0;
-	mm->locked_vm += nr_pages;
-
-	/*
-	 * vm_flags is protected by the mmap_lock held in write mode.
-	 * It's okay if try_to_unmap_one unmaps a page just after we
-	 * set VMA_LOCKED_BIT, populate_vma_page_range will bring it back.
-	 */
-	if (vma_flags_test(new_vma_flags, VMA_LOCKED_BIT) &&
-	    vma_flags_test(&old_vma_flags, VMA_LOCKED_BIT)) {
-		/* No work to do, and mlocking twice would be wrong */
-		vma_start_write(vma);
-		vma->flags = *new_vma_flags;
-	} else {
-		mlock_vma_pages_range(vma, start, end, new_vma_flags);
-	}
-out:
-	*prev = vma;
-	return ret;
+	rust_ret = rust_mlfix_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mlfix(&s);
 }
 
 static int apply_vma_lock_flags(unsigned long start, size_t len,
@@ -616,27 +703,41 @@ static int __mlock_posix_error_return(long retval)
 	return retval;
 }
 
-static __must_check int do_mlock(unsigned long start, size_t len,
-				 vma_flags_t *flags)
+#define MLOCK_DONE		0
+#define MLOCK_CONT		1
+#define MLOCK_POPULATE		2
+
+static int mlock_prepare(unsigned long *start, size_t *len, int *out)
+{
+	*out = 0;
+	*start = untagged_addr(*start);
+
+	if (!can_do_mlock()) {
+		*out = -EPERM;
+		return MLOCK_DONE;
+	}
+
+	*len = PAGE_ALIGN(*len + (offset_in_page(*start)));
+	*start &= PAGE_MASK;
+	return MLOCK_CONT;
+}
+
+static int mlock_apply(unsigned long start, size_t len, vma_flags_t *flags,
+		       int *out)
 {
 	unsigned long locked;
 	unsigned long lock_limit;
 	int error = -ENOMEM;
 
-	start = untagged_addr(start);
-
-	if (!can_do_mlock())
-		return -EPERM;
-
-	len = PAGE_ALIGN(len + (offset_in_page(start)));
-	start &= PAGE_MASK;
-
+	*out = 0;
 	lock_limit = rlimit(RLIMIT_MEMLOCK);
 	lock_limit >>= PAGE_SHIFT;
 	locked = len >> PAGE_SHIFT;
 
-	if (mmap_write_lock_killable(current->mm))
-		return -EINTR;
+	if (mmap_write_lock_killable(current->mm)) {
+		*out = -EINTR;
+		return MLOCK_DONE;
+	}
 
 	locked += current->mm->locked_vm;
 	if ((locked > lock_limit) && (!capable(CAP_IPC_LOCK))) {
@@ -646,8 +747,7 @@ static __must_check int do_mlock(unsigned long start, size_t len,
 		 * should not be counted to new mlock increment count. So check
 		 * and adjust locked count if necessary.
 		 */
-		locked -= count_mm_mlocked_page_nr(current->mm,
-				start, len);
+		locked -= count_mm_mlocked_page_nr(current->mm, start, len);
 	}
 
 	/* check against resource limits */
@@ -655,13 +755,67 @@ static __must_check int do_mlock(unsigned long start, size_t len,
 		error = apply_vma_lock_flags(start, len, flags);
 
 	mmap_write_unlock(current->mm);
-	if (error)
-		return error;
+	if (error) {
+		*out = error;
+		return MLOCK_DONE;
+	}
+	return MLOCK_POPULATE;
+}
+
+static int mlock_populate(unsigned long start, size_t len)
+{
+	int error;
 
 	error = __mm_populate(start, len, 0);
 	if (error)
 		return __mlock_posix_error_return(error);
 	return 0;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mlock_prepare(unsigned long *start, size_t *len, int *out)
+{
+	return mlock_prepare(start, len, out);
+}
+
+int rust_mlock_apply(unsigned long start, size_t len, vma_flags_t *flags,
+		     int *out)
+{
+	return mlock_apply(start, len, flags, out);
+}
+
+int rust_mlock_populate(unsigned long start, size_t len)
+{
+	return mlock_populate(start, len);
+}
+#endif
+
+static int finish_mlock(unsigned long *start, size_t *len, vma_flags_t *flags)
+{
+	int out = 0;
+	int kind;
+
+	kind = mlock_prepare(start, len, &out);
+	if (kind == MLOCK_DONE)
+		return out;
+	kind = mlock_apply(*start, *len, flags, &out);
+	if (kind == MLOCK_DONE)
+		return out;
+	return mlock_populate(*start, *len);
+}
+
+static __must_check int do_mlock(unsigned long start, size_t len,
+				 vma_flags_t *flags)
+{
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mlock_dispatch(&start, &len, flags, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mlock(&start, &len, flags);
 }
 
 SYSCALL_DEFINE2(mlock, unsigned long, start, size_t, len)

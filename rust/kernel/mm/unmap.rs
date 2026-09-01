@@ -9,11 +9,14 @@
 //! check vs maple-tree unmap), `do_brk_flags` (expand vs new anonymous VMA),
 //! `do_mprotect_pkey` (validate vs VMA walk), `mprotect_fixup` (prepare vs
 //! `vma_modify_flags` vs `change_protection`), `do_mremap` (move vs
-//! `mremap_to` vs `mremap_at`), and `do_madvise` (validate vs lock/walk).
+//! `mremap_to` vs `mremap_at`), `do_madvise` (validate vs lock/walk),
+//! `mseal` (validate vs lock/seal), `do_mlock` (prepare vs lock/apply vs
+//! populate), and `mlock_fixup` (filter vs `vma_modify_flags` vs pages).
 //! Maple-tree storage and the merge / new-VMA / `change_protection` /
-//! page-table move / madvise VMA-walk bodies stay in C. The mmap lock is
-//! already held by the C caller except for mprotect, mremap, and madvise,
-//! which take it in apply / lock.
+//! page-table move / madvise VMA-walk / seal-range / mlock page-walk
+//! bodies stay in C. The mmap lock is already held by the C caller except
+//! for mprotect, mremap, madvise, mseal, and mlock, which take it in
+//! apply / lock.
 
 use crate::{
     bindings,
@@ -92,6 +95,27 @@ const MPFIX_MODIFY: i32 = 1;
 /// VMA updated; apply protection and accounting.
 const MPFIX_APPLY: i32 = 2;
 
+/// Matches `RUST_MSEAL_*` in `include/linux/mm.h`.
+#[cfg(CONFIG_64BIT)]
+const MSEAL_DONE: i32 = 0;
+/// Range is valid; lock and seal VMAs.
+#[cfg(CONFIG_64BIT)]
+const MSEAL_APPLY: i32 = 1;
+
+/// Matches `RUST_MLOCK_*` in `include/linux/mm.h`.
+const MLOCK_DONE: i32 = 0;
+/// Capability and alignment passed; lock, apply flags, unlock.
+const MLOCK_CONT: i32 = 1;
+/// Flags applied; populate the range.
+const MLOCK_POPULATE: i32 = 2;
+
+/// Matches `RUST_MLFIX_*` in `include/linux/mm.h`.
+const MLFIX_DONE: i32 = 0;
+/// Filter passed; split/merge via `vma_modify_flags`.
+const MLFIX_MODIFY: i32 = 1;
+/// VMA updated; account locked pages and walk PTEs.
+const MLFIX_PAGES: i32 = 2;
+
 static N_MUNMAP: Atomic<u32> = Atomic::new(0);
 static N_DOMMAP: Atomic<u32> = Atomic::new(0);
 static N_BRK: Atomic<u32> = Atomic::new(0);
@@ -100,6 +124,10 @@ static N_MREMAP: Atomic<u32> = Atomic::new(0);
 static N_MADVISE: Atomic<u32> = Atomic::new(0);
 static N_MMAPREG: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
+#[cfg(CONFIG_64BIT)]
+static N_MSEAL: Atomic<u32> = Atomic::new(0);
+static N_MLOCK: Atomic<u32> = Atomic::new(0);
+static N_MLFIX: Atomic<u32> = Atomic::new(0);
 
 fn enomem() -> c_ulong {
     ENOMEM.to_errno() as c_ulong
@@ -288,7 +316,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup sequencer\n");
 }
 
 /// C ABI for [`vm_unmapped_area`]: first-fit bottom-up or top-down.
@@ -873,4 +901,156 @@ pub unsafe extern "C" fn rust_mpfix_dispatch(
 
     // SAFETY: `s->vma` is the live mapping after modify.
     unsafe { bindings::rust_mpfix_apply(s) }
+}
+
+/// C ABI: sequence `mseal` after C validates flags and alignment.
+///
+/// Sets `*handled` once validate has run. The mmap lock and VMA seal
+/// walk stay in C.
+///
+/// # Safety
+///
+/// `req` must be a live request filled by `do_mseal`. `handled` must
+/// be a valid out-parameter. No mmap lock is held on entry.
+#[cfg(CONFIG_64BIT)]
+#[no_mangle]
+pub unsafe extern "C" fn rust_mseal_dispatch(
+    req: *mut bindings::rust_mseal_req,
+    handled: *mut c_int,
+) -> c_int {
+    if req.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; `req` holds the syscall arguments.
+    let kind = unsafe { bindings::rust_mseal_validate(req, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MSEAL.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mseal sequenced\n");
+    }
+
+    match kind {
+        MSEAL_DONE => out,
+        // SAFETY: Range is valid; apply takes the mmap write lock.
+        MSEAL_APPLY => unsafe { bindings::rust_mseal_apply(req) },
+        _ => {
+            pr_err!("rust-mmap: unknown mseal kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `do_mlock` after C checks capability and alignment.
+///
+/// Sets `*handled` once prepare has run. Lock-fail and apply-fail
+/// return without populate. Success unlocks, then populates.
+///
+/// # Safety
+///
+/// `start`, `len`, `flags`, and `handled` must be valid. No mmap lock
+/// is held on entry. Prepare may rewrite `*start` and `*len`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mlock_dispatch(
+    start: *mut c_ulong,
+    len: *mut usize,
+    flags: *mut bindings::vma_flags_t,
+    handled: *mut c_int,
+) -> c_int {
+    if start.is_null() || len.is_null() || flags.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: No mmap lock yet; pointers are the syscall arguments.
+    let kind = unsafe { bindings::rust_mlock_prepare(start, len, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MLOCK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mlock sequenced\n");
+    }
+
+    if kind == MLOCK_DONE {
+        return out;
+    }
+    if kind != MLOCK_CONT {
+        pr_err!("rust-mmap: unknown mlock prepare kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: Aligned range; apply takes the mmap write lock.
+    let kind = unsafe { bindings::rust_mlock_apply(*start, *len, flags, &mut out) };
+    if kind == MLOCK_DONE {
+        return out;
+    }
+    if kind != MLOCK_POPULATE {
+        pr_err!("rust-mmap: unknown mlock apply kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: Flags applied and mmap lock dropped; populate the range.
+    unsafe { bindings::rust_mlock_populate(*start, *len) }
+}
+
+/// C ABI: sequence `mlock_fixup` after C filters special VMAs.
+///
+/// Sets `*handled` once prepare has run. Maple-tree split/merge stays
+/// in `vma_modify_flags`; PTE mlock/munlock stays in C.
+///
+/// # Safety
+///
+/// mmap write lock held as for `mlock_fixup`. `s` must be the live
+/// state filled by `mlock_fixup`. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_mlfix_dispatch(
+    s: *mut bindings::rust_mlfix_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: mmap write lock held; `s` holds the VMA range and new flags.
+    let kind = unsafe { bindings::rust_mlfix_prepare(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_MLFIX.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first mlock_fixup sequenced\n");
+    }
+
+    if kind == MLFIX_DONE {
+        return out;
+    }
+    if kind != MLFIX_MODIFY {
+        pr_err!("rust-mmap: unknown mlock_fixup prepare kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: Filter passed; split or merge the VMA.
+    let kind = unsafe { bindings::rust_mlfix_modify(s, &mut out) };
+    if kind == MLFIX_DONE {
+        return out;
+    }
+    if kind != MLFIX_PAGES {
+        pr_err!("rust-mmap: unknown mlock_fixup modify kind {kind}\n");
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: `s->vma` is the live mapping after modify.
+    unsafe { bindings::rust_mlfix_pages(s) }
 }

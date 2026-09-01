@@ -4436,6 +4436,36 @@ int rust_mpfix_dispatch(struct rust_mpfix_state *s, int *handled);
 int rust_mpfix_prepare(struct rust_mpfix_state *s, int *out);
 int rust_mpfix_modify(struct rust_mpfix_state *s, int *out);
 int rust_mpfix_apply(struct rust_mpfix_state *s);
+#ifdef CONFIG_64BIT
+struct rust_mseal_req {
+	unsigned long start;
+	size_t len;
+	unsigned long flags;
+	unsigned long end;
+};
+#define RUST_MSEAL_DONE		0
+#define RUST_MSEAL_APPLY	1
+int rust_mseal_dispatch(struct rust_mseal_req *req, int *handled);
+int rust_mseal_validate(struct rust_mseal_req *req, int *out);
+int rust_mseal_apply(struct rust_mseal_req *req);
+#endif
+#define RUST_MLOCK_DONE		0
+#define RUST_MLOCK_CONT		1
+#define RUST_MLOCK_POPULATE	2
+int rust_mlock_dispatch(unsigned long *start, size_t *len, vma_flags_t *flags,
+			int *handled);
+int rust_mlock_prepare(unsigned long *start, size_t *len, int *out);
+int rust_mlock_apply(unsigned long start, size_t len, vma_flags_t *flags,
+		     int *out);
+int rust_mlock_populate(unsigned long start, size_t len);
+struct rust_mlfix_state;
+#define RUST_MLFIX_DONE		0
+#define RUST_MLFIX_MODIFY	1
+#define RUST_MLFIX_PAGES	2
+int rust_mlfix_dispatch(struct rust_mlfix_state *s, int *handled);
+int rust_mlfix_prepare(struct rust_mlfix_state *s, int *out);
+int rust_mlfix_modify(struct rust_mlfix_state *s, int *out);
+int rust_mlfix_pages(struct rust_mlfix_state *s);
 #endif
 #ifdef CONFIG_RUST_FAULT
 #define RUST_PTE_DONE		0

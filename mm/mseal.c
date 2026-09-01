@@ -98,6 +98,103 @@ void mseal_mmap_page_zero(void)
 				    task_pid_nr(current), err);
 }
 
+#define MSEAL_DONE		0
+#define MSEAL_APPLY		1
+
+#ifndef CONFIG_RUST_MMAP
+struct rust_mseal_req {
+	unsigned long start;
+	size_t len;
+	unsigned long flags;
+	unsigned long end;
+};
+#endif
+
+static int mseal_validate(struct rust_mseal_req *req, int *out)
+{
+	size_t len_aligned;
+	unsigned long end;
+
+	*out = 0;
+	/* Verify flags not set. */
+	if (req->flags) {
+		*out = -EINVAL;
+		return MSEAL_DONE;
+	}
+
+	req->start = untagged_addr(req->start);
+	if (!PAGE_ALIGNED(req->start)) {
+		*out = -EINVAL;
+		return MSEAL_DONE;
+	}
+
+	len_aligned = PAGE_ALIGN(req->len);
+	/* Check to see whether len was rounded up from small -ve to zero. */
+	if (req->len && !len_aligned) {
+		*out = -EINVAL;
+		return MSEAL_DONE;
+	}
+
+	end = req->start + len_aligned;
+	if (end < req->start) {
+		*out = -EINVAL;
+		return MSEAL_DONE;
+	}
+
+	if (end == req->start)
+		return MSEAL_DONE;
+
+	req->end = end;
+	return MSEAL_APPLY;
+}
+
+static int mseal_apply(struct rust_mseal_req *req)
+{
+	return mseal_range(req->start, req->end);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mseal_validate(struct rust_mseal_req *req, int *out)
+{
+	return mseal_validate(req, out);
+}
+
+int rust_mseal_apply(struct rust_mseal_req *req)
+{
+	return mseal_apply(req);
+}
+#endif
+
+static int finish_mseal(struct rust_mseal_req *req)
+{
+	int out = 0;
+	int kind;
+
+	kind = mseal_validate(req, &out);
+	if (kind == MSEAL_DONE)
+		return out;
+	return mseal_apply(req);
+}
+
+static int do_mseal(unsigned long start, size_t len, unsigned long flags)
+{
+	struct rust_mseal_req req = {
+		.start = start,
+		.len = len,
+		.flags = flags,
+	};
+
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_mseal_dispatch(&req, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_mseal(&req);
+}
+
 /*
  * Seal VMAs in the specified input range to prevent an attacker replacing what
  * is mapped in the range with something else.
@@ -116,28 +213,5 @@ void mseal_mmap_page_zero(void)
  */
 SYSCALL_DEFINE3(mseal, unsigned long, start, size_t, len, unsigned long, flags)
 {
-	size_t len_aligned;
-	unsigned long end;
-
-	/* Verify flags not set. */
-	if (flags)
-		return -EINVAL;
-
-	start = untagged_addr(start);
-	if (!PAGE_ALIGNED(start))
-		return -EINVAL;
-
-	len_aligned = PAGE_ALIGN(len);
-	/* Check to see whether len was rounded up from small -ve to zero. */
-	if (len && !len_aligned)
-		return -EINVAL;
-
-	end = start + len_aligned;
-	if (end < start)
-		return -EINVAL;
-
-	if (end == start)
-		return 0;
-
-	return mseal_range(start, end);
+	return do_mseal(start, len, flags);
 }
