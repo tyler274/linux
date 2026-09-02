@@ -808,22 +808,28 @@ static void vmg_adjust_set_range(struct vma_merge_struct *vmg)
  *
  * Returns 0 on success, or an error value on failure.
  */
-static int commit_merge(struct vma_merge_struct *vmg)
-{
-	struct vm_area_struct *vma;
-	struct vma_prepare vp;
+#define CMERGE_DONE		0
+#define CMERGE_APPLY		1
 
+struct rust_cmerge_state {
+	struct vma_merge_struct *vmg;
+	struct vm_area_struct *vma;
+};
+
+static int cmerge_classify(struct rust_cmerge_state *s, int *out)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+
+	*out = 0;
 	if (vmg->__adjust_next_start) {
 		/* We manipulate middle and adjust next, which is the target. */
-		vma = vmg->middle;
+		s->vma = vmg->middle;
 		vma_iter_config(vmg->vmi, vmg->end, vmg->next->vm_end);
 	} else {
-		vma = vmg->target;
+		s->vma = vmg->target;
 		 /* Note: vma iterator must be pointing to 'start'. */
 		vma_iter_config(vmg->vmi, vmg->start, vmg->end);
 	}
-
-	init_multi_vma_prep(&vp, vma, vmg);
 
 	/*
 	 * If vmg->give_up_on_oom is set, we're safe, because we don't actually
@@ -831,9 +837,20 @@ static int commit_merge(struct vma_merge_struct *vmg)
 	 *
 	 * Past this point, we will not return an error.
 	 */
-	if (vma_iter_prealloc(vmg->vmi, vma))
-		return -ENOMEM;
+	if (vma_iter_prealloc(vmg->vmi, s->vma)) {
+		*out = -ENOMEM;
+		return CMERGE_DONE;
+	}
+	return CMERGE_APPLY;
+}
 
+static int cmerge_apply(struct rust_cmerge_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
+	struct vm_area_struct *vma = s->vma;
+	struct vma_prepare vp;
+
+	init_multi_vma_prep(&vp, vma, vmg);
 	vma_prepare(&vp);
 	/*
 	 * THP pages may need to do additional splits if we increase
@@ -847,8 +864,44 @@ static int commit_merge(struct vma_merge_struct *vmg)
 	vma_iter_store_overwrite(vmg->vmi, vmg->target);
 
 	vma_complete(&vp, vmg->vmi, vma->vm_mm);
-
 	return 0;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_cmerge_classify(struct rust_cmerge_state *s, int *out)
+{
+	return cmerge_classify(s, out);
+}
+
+int rust_cmerge_apply(struct rust_cmerge_state *s)
+{
+	return cmerge_apply(s);
+}
+#endif
+
+static int finish_cmerge(struct rust_cmerge_state *s)
+{
+	int out = 0;
+
+	if (cmerge_classify(s, &out) == CMERGE_DONE)
+		return out;
+	return cmerge_apply(s);
+}
+
+static int commit_merge(struct vma_merge_struct *vmg)
+{
+	struct rust_cmerge_state s = {
+		.vmg = vmg,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_cmerge_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_cmerge(&s);
 }
 
 /* We can only remove VMAs when merging if they do not have a close hook. */
@@ -1568,28 +1621,83 @@ int vma_expand(struct vma_merge_struct *vmg)
  *
  * Returns: 0 on success, -ENOMEM otherwise
  */
-int vma_shrink(struct vma_iterator *vmi, struct vm_area_struct *vma,
-	       unsigned long end)
+#define VSH_DONE		0
+#define VSH_APPLY		1
+
+struct rust_vsh_state {
+	struct vma_iterator *vmi;
+	struct vm_area_struct *vma;
+	unsigned long end;
+};
+
+static int vsh_classify(struct rust_vsh_state *s, int *out)
+{
+	*out = 0;
+	VM_WARN_ON_ONCE(s->end > s->vma->vm_end);
+
+	vma_iter_config(s->vmi, s->end, s->vma->vm_end);
+	if (vma_iter_prealloc(s->vmi, NULL)) {
+		*out = -ENOMEM;
+		return VSH_DONE;
+	}
+	return VSH_APPLY;
+}
+
+static int vsh_apply(struct rust_vsh_state *s)
 {
 	struct vma_prepare vp;
 
-	VM_WARN_ON_ONCE(end > vma->vm_end);
+	vma_start_write(s->vma);
 
-	vma_iter_config(vmi, end, vma->vm_end);
-	if (vma_iter_prealloc(vmi, NULL))
-		return -ENOMEM;
-
-	vma_start_write(vma);
-
-	init_vma_prep(&vp, vma);
+	init_vma_prep(&vp, s->vma);
 	vma_prepare(&vp);
-	vma_adjust_trans_huge(vma, vma->vm_start, end, NULL);
+	vma_adjust_trans_huge(s->vma, s->vma->vm_start, s->end, NULL);
 
-	vma_iter_clear(vmi);
-	__vma_set_range(vma, vma->vm_start, end);
-	vma_complete(&vp, vmi, vma->vm_mm);
-	validate_mm(vma->vm_mm);
+	vma_iter_clear(s->vmi);
+	__vma_set_range(s->vma, s->vma->vm_start, s->end);
+	vma_complete(&vp, s->vmi, s->vma->vm_mm);
+	validate_mm(s->vma->vm_mm);
 	return 0;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vsh_classify(struct rust_vsh_state *s, int *out)
+{
+	return vsh_classify(s, out);
+}
+
+int rust_vsh_apply(struct rust_vsh_state *s)
+{
+	return vsh_apply(s);
+}
+#endif
+
+static int finish_vsh(struct rust_vsh_state *s)
+{
+	int out = 0;
+
+	if (vsh_classify(s, &out) == VSH_DONE)
+		return out;
+	return vsh_apply(s);
+}
+
+int vma_shrink(struct vma_iterator *vmi, struct vm_area_struct *vma,
+	       unsigned long end)
+{
+	struct rust_vsh_state s = {
+		.vmi = vmi,
+		.vma = vma,
+		.end = end,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	int rust_ret;
+
+	rust_ret = rust_vsh_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vsh(&s);
 }
 
 static inline void vms_clear_ptes(struct vma_munmap_struct *vms,
@@ -2037,19 +2145,39 @@ int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
  * The function returns either the merged VMA, the original VMA if a split was
  * required instead, or an error if the split failed.
  */
-static struct vm_area_struct *vma_modify(struct vma_merge_struct *vmg)
+#define VMOD_DONE		0
+#define VMOD_SPLIT		1
+
+struct rust_vmod_state {
+	struct vma_merge_struct *vmg;
+};
+
+static int vmod_classify(struct rust_vmod_state *s,
+			 struct vm_area_struct **ret)
 {
+	struct vma_merge_struct *vmg = s->vmg;
+	struct vm_area_struct *merged;
+
+	*ret = NULL;
+	merged = vma_merge_existing_range(vmg);
+	if (merged) {
+		*ret = merged;
+		return VMOD_DONE;
+	}
+	if (vmg_nomem(vmg)) {
+		*ret = ERR_PTR(-ENOMEM);
+		return VMOD_DONE;
+	}
+	return VMOD_SPLIT;
+}
+
+static struct vm_area_struct *vmod_split(struct rust_vmod_state *s)
+{
+	struct vma_merge_struct *vmg = s->vmg;
 	struct vm_area_struct *vma = vmg->middle;
 	unsigned long start = vmg->start;
 	unsigned long end = vmg->end;
-	struct vm_area_struct *merged;
-
-	/* First, try to merge. */
-	merged = vma_merge_existing_range(vmg);
-	if (merged)
-		return merged;
-	if (vmg_nomem(vmg))
-		return ERR_PTR(-ENOMEM);
+	int err;
 
 	/*
 	 * Split can fail for reasons other than OOM, so if the user requests
@@ -2060,21 +2188,56 @@ static struct vm_area_struct *vma_modify(struct vma_merge_struct *vmg)
 
 	/* Split any preceding portion of the VMA. */
 	if (vma->vm_start < start) {
-		int err = split_vma(vmg->vmi, vma, start, 1);
-
+		err = split_vma(vmg->vmi, vma, start, 1);
 		if (err)
 			return ERR_PTR(err);
 	}
 
 	/* Split any trailing portion of the VMA. */
 	if (vma->vm_end > end) {
-		int err = split_vma(vmg->vmi, vma, end, 0);
-
+		err = split_vma(vmg->vmi, vma, end, 0);
 		if (err)
 			return ERR_PTR(err);
 	}
 
 	return vma;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vmod_classify(struct rust_vmod_state *s, struct vm_area_struct **ret)
+{
+	return vmod_classify(s, ret);
+}
+
+struct vm_area_struct *rust_vmod_split(struct rust_vmod_state *s)
+{
+	return vmod_split(s);
+}
+#endif
+
+static struct vm_area_struct *finish_vmod(struct rust_vmod_state *s)
+{
+	struct vm_area_struct *ret = NULL;
+
+	if (vmod_classify(s, &ret) == VMOD_DONE)
+		return ret;
+	return vmod_split(s);
+}
+
+static struct vm_area_struct *vma_modify(struct vma_merge_struct *vmg)
+{
+	struct rust_vmod_state s = {
+		.vmg = vmg,
+	};
+#ifdef CONFIG_RUST_MMAP
+	int handled = 0;
+	struct vm_area_struct *rust_ret;
+
+	rust_ret = rust_vmod_dispatch(&s, &handled);
+	if (handled)
+		return rust_ret;
+#endif
+	return finish_vmod(&s);
 }
 
 struct vm_area_struct *vma_modify_flags(struct vma_iterator *vmi,

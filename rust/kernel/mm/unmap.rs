@@ -25,9 +25,11 @@
 //! `brk` (shrink vs expand vs unlock/populate), `process_madvise`
 //! (pidfd/iovec vs vector walk), `vm_brk_flags` (lock/limits vs munmap
 //! vs do_brk vs populate), `vma_merge_existing_range` (no-merge vs
-//! both/left/right), `vma_expand` (dup vs commit), and `expand_stack`
-//! (found vs grow-up vs grow-down). The VMA maple tree is a Rust RCU
-//! range array.
+//! both/left/right), `vma_expand` (dup vs commit), `expand_stack`
+//! (found vs grow-up vs grow-down), `vma_modify` (merge vs split),
+//! `vma_shrink` (prealloc vs apply), `commit_merge` (prealloc vs
+//! apply), and `remap_file_pages` (validate vs LSM vs `do_mmap`). The
+//! VMA maple tree is a Rust RCU range array.
 //! File mmap/shmem / `change_protection` / page-table move / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
 //! held by the C caller except for mprotect, mremap, madvise, mseal,
@@ -37,7 +39,7 @@
 use crate::{
     bindings,
     error::code::{EINVAL, ENOMEM},
-    ffi::{c_int, c_ulong},
+    ffi::{c_int, c_long, c_ulong},
     mm::virt::VmaRef,
     prelude::*,
     sync::atomic::{
@@ -105,6 +107,28 @@ const VEXP_COMMIT: i32 = 1;
 const ESTK_DONE: i32 = 0;
 /// VMA found or grown; downgrade write to read.
 const ESTK_DOWNGRADE: i32 = 1;
+
+/// Matches `RUST_VMOD_*` in `include/linux/mm.h`.
+const VMOD_DONE: i32 = 0;
+/// Merge failed; split preceding and/or trailing.
+const VMOD_SPLIT: i32 = 1;
+
+/// Matches `RUST_VSH_*` in `include/linux/mm.h`.
+const VSH_DONE: i32 = 0;
+/// Prealloc ok; shrink the VMA.
+const VSH_APPLY: i32 = 1;
+
+/// Matches `RUST_CMERGE_*` in `include/linux/mm.h`.
+const CMERGE_DONE: i32 = 0;
+/// Prealloc ok; prepare, THP, range, maple store.
+const CMERGE_APPLY: i32 = 1;
+
+/// Matches `RUST_RFP_*` in `include/linux/mm.h`.
+const RFP_DONE: i32 = 0;
+/// Range and shared VMA found; LSM check outside the mmap lock.
+const RFP_SEC: i32 = 1;
+/// LSM passed; write-lock and `do_mmap`.
+const RFP_APPLY: i32 = 2;
 
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
@@ -257,6 +281,10 @@ static N_MMAPREG: Atomic<u32> = Atomic::new(0);
 static N_VMERGE: Atomic<u32> = Atomic::new(0);
 static N_VEXP: Atomic<u32> = Atomic::new(0);
 static N_ESTK: Atomic<u32> = Atomic::new(0);
+static N_VMOD: Atomic<u32> = Atomic::new(0);
+static N_VSH: Atomic<u32> = Atomic::new(0);
+static N_CMERGE: Atomic<u32> = Atomic::new(0);
+static N_RFP: Atomic<u32> = Atomic::new(0);
 static N_VEX: Atomic<u32> = Atomic::new(0);
 static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
@@ -465,7 +493,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages sequencer\n");
     crate::mm::mtree::announce_once();
 }
 
@@ -2012,7 +2040,7 @@ pub unsafe extern "C" fn rust_vex_dispatch(
         unsafe { bindings::rust_vex_abort(s) };
         return ptr::null_mut();
     }
-    // SAFETY: Anon vmas cloned; maple-tree commit stays in C.
+    // SAFETY: Anon vmas cloned; `commit_merge` runs from C.
     let committed = unsafe { bindings::rust_vex_commit(s) };
     if committed.is_null() {
         // SAFETY: commit_merge failed; reset the iterator.
@@ -2024,8 +2052,8 @@ pub unsafe extern "C" fn rust_vex_dispatch(
 
 /// C ABI: sequence `vma_expand` after C clones anon_vmas.
 ///
-/// Sets `*handled` once classify has run. Maple-tree `commit_merge`
-/// stays in C. Unknown kind or a failed commit unlinks a partial
+/// Sets `*handled` once classify has run. `commit_merge` is sequenced
+/// separately. Unknown kind or a failed commit unlinks a partial
 /// anon_vma clone.
 ///
 /// # Safety
@@ -2057,7 +2085,7 @@ pub unsafe extern "C" fn rust_vexp_dispatch(
     match kind {
         VEXP_DONE => out,
         VEXP_COMMIT => {
-            // SAFETY: Anon vmas cloned; maple-tree commit stays in C.
+            // SAFETY: Anon vmas cloned; `commit_merge` runs from C.
             let err = unsafe { bindings::rust_vexp_commit(s) };
             if err != 0 {
                 // SAFETY: commit_merge failed; unlink the clone.
@@ -2115,6 +2143,190 @@ pub unsafe extern "C" fn rust_estk_dispatch(
             // SAFETY: Drop a leftover write lock.
             unsafe { bindings::rust_estk_abort(s) };
             ptr::null_mut()
+        }
+    }
+}
+
+/// C ABI: sequence `vma_modify` after C tries a merge.
+///
+/// Sets `*handled` once classify has run. Split stays in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vmod_state` with `vmg` filled. mmap write
+/// lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vmod_dispatch(
+    s: *mut bindings::rust_vmod_state,
+    handled: *mut c_int,
+) -> *mut bindings::vm_area_struct {
+    if s.is_null() || handled.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut merged = ptr::null_mut();
+    // SAFETY: `s` is live; classify may merge existing VMAs.
+    let kind = unsafe { bindings::rust_vmod_classify(s, &mut merged) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VMOD.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_modify sequenced\n");
+    }
+
+    match kind {
+        VMOD_DONE => merged,
+        // SAFETY: Merge failed; split preceding/trailing in C.
+        VMOD_SPLIT => unsafe { bindings::rust_vmod_split(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vma_modify kind {kind}\n");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// C ABI: sequence `vma_shrink` after C preallocates.
+///
+/// Sets `*handled` once classify has run. THP adjust, maple clear,
+/// and `vma_complete` stay in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vsh_state` with `vmi`/`vma`/`end` filled.
+/// mmap write lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vsh_dispatch(
+    s: *mut bindings::rust_vsh_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may preallocate maple nodes.
+    let kind = unsafe { bindings::rust_vsh_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VSH.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_shrink sequenced\n");
+    }
+
+    match kind {
+        VSH_DONE => out,
+        // SAFETY: Prealloc ok; shrink the VMA in C.
+        VSH_APPLY => unsafe { bindings::rust_vsh_apply(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vma_shrink kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `commit_merge` after C preallocates maple nodes.
+///
+/// Sets `*handled` once classify has run. THP adjust, range update,
+/// maple store, and `vma_complete` stay in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_cmerge_state` with `vmg` filled. mmap
+/// write lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_cmerge_dispatch(
+    s: *mut bindings::rust_cmerge_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may preallocate maple nodes.
+    let kind = unsafe { bindings::rust_cmerge_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_CMERGE.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first commit_merge sequenced\n");
+    }
+
+    match kind {
+        CMERGE_DONE => out,
+        // SAFETY: Prealloc ok; prepare/store/complete in C.
+        CMERGE_APPLY => unsafe { bindings::rust_cmerge_apply(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown commit_merge kind {kind}\n");
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `remap_file_pages` after C validates the range.
+///
+/// Sets `*handled` once classify has run. LSM `security_mmap_file` and
+/// the write-locked `do_mmap` stay in C. Unknown kind drops a leftover
+/// file ref and mmap write lock.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_rfp_state` with syscall fields filled. No
+/// mmap lock is held on entry. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_rfp_dispatch(
+    s: *mut bindings::rust_rfp_state,
+    handled: *mut c_int,
+) -> c_long {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno() as c_long;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_long = 0;
+    // SAFETY: `s` is live; classify may take the mmap read lock.
+    let kind = unsafe { bindings::rust_rfp_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_RFP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first remap_file_pages sequenced\n");
+    }
+
+    match kind {
+        RFP_DONE => out,
+        RFP_SEC => {
+            // SAFETY: Shared VMA found; LSM check outside the mmap lock.
+            let kind = unsafe { bindings::rust_rfp_security(s, &mut out) };
+            match kind {
+                RFP_DONE => out,
+                // SAFETY: LSM passed; write-lock and `do_mmap` in C.
+                RFP_APPLY => unsafe { bindings::rust_rfp_apply(s) },
+                _ => {
+                    pr_err!("rust-mmap: unknown remap_file_pages security kind {kind}\n");
+                    // SAFETY: Drop a leftover file ref.
+                    unsafe { bindings::rust_rfp_abort(s) };
+                    EINVAL.to_errno() as c_long
+                }
+            }
+        }
+        _ => {
+            pr_err!("rust-mmap: unknown remap_file_pages kind {kind}\n");
+            // SAFETY: Drop a leftover file ref or write lock.
+            unsafe { bindings::rust_rfp_abort(s) };
+            EINVAL.to_errno() as c_long
         }
     }
 }

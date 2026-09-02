@@ -4372,6 +4372,15 @@ int rust_vmbrk_dispatch(struct rust_vmbrk_state *s, int *handled);
 int rust_vmbrk_classify(struct rust_vmbrk_state *s, int *out);
 int rust_vmbrk_exit(struct rust_vmbrk_state *s);
 void rust_vmbrk_abort(struct rust_vmbrk_state *s);
+struct rust_rfp_state;
+#define RUST_RFP_DONE		0
+#define RUST_RFP_SEC		1
+#define RUST_RFP_APPLY		2
+long rust_rfp_dispatch(struct rust_rfp_state *s, int *handled);
+int rust_rfp_classify(struct rust_rfp_state *s, long *out);
+int rust_rfp_security(struct rust_rfp_state *s, long *out);
+long rust_rfp_apply(struct rust_rfp_state *s);
+void rust_rfp_abort(struct rust_rfp_state *s);
 struct rust_estk_state;
 #define RUST_ESTK_DONE		0
 #define RUST_ESTK_DOWNGRADE	1
@@ -4464,6 +4473,26 @@ int rust_vexp_dispatch(struct rust_vexp_state *s, int *handled);
 int rust_vexp_classify(struct rust_vexp_state *s, int *out);
 int rust_vexp_commit(struct rust_vexp_state *s);
 void rust_vexp_abort(struct rust_vexp_state *s);
+struct rust_vmod_state;
+#define RUST_VMOD_DONE		0
+#define RUST_VMOD_SPLIT		1
+struct vm_area_struct *rust_vmod_dispatch(struct rust_vmod_state *s,
+					  int *handled);
+int rust_vmod_classify(struct rust_vmod_state *s,
+		       struct vm_area_struct **ret);
+struct vm_area_struct *rust_vmod_split(struct rust_vmod_state *s);
+struct rust_vsh_state;
+#define RUST_VSH_DONE		0
+#define RUST_VSH_APPLY		1
+int rust_vsh_dispatch(struct rust_vsh_state *s, int *handled);
+int rust_vsh_classify(struct rust_vsh_state *s, int *out);
+int rust_vsh_apply(struct rust_vsh_state *s);
+struct rust_cmerge_state;
+#define RUST_CMERGE_DONE	0
+#define RUST_CMERGE_APPLY	1
+int rust_cmerge_dispatch(struct rust_cmerge_state *s, int *handled);
+int rust_cmerge_classify(struct rust_cmerge_state *s, int *out);
+int rust_cmerge_apply(struct rust_cmerge_state *s);
 struct rust_vex_state;
 #define RUST_VEX_NONE		0
 #define RUST_VEX_BOTH		1

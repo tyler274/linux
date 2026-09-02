@@ -1381,76 +1381,110 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 /*
  * Emulation of deprecated remap_file_pages() syscall.
  */
-SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
-		unsigned long, prot, unsigned long, pgoff, unsigned long, flags)
-{
+#define RFP_DONE		0
+#define RFP_SEC			1
+#define RFP_APPLY		2
 
-	struct mm_struct *mm = current->mm;
+struct rust_rfp_state {
+	unsigned long start;
+	unsigned long size;
+	unsigned long prot;
+	unsigned long pgoff;
+	unsigned long flags;
+	struct mm_struct *mm;
 	struct vm_area_struct *vma;
-	unsigned long populate = 0;
-	unsigned long ret = -EINVAL;
 	struct file *file;
 	vm_flags_t vm_flags;
+	unsigned long populate;
+	bool write_locked;
+};
 
-	pr_warn_once("%s (%d) uses deprecated remap_file_pages() syscall. See Documentation/mm/remap_file_pages.rst.\n",
-		     current->comm, current->pid);
+static int rfp_classify(struct rust_rfp_state *s, long *out)
+{
+	*out = -EINVAL;
+	s->mm = current->mm;
+	s->vma = NULL;
+	s->file = NULL;
+	s->populate = 0;
+	s->write_locked = false;
 
-	if (prot)
-		return ret;
-	start = start & PAGE_MASK;
-	size = size & PAGE_MASK;
+	if (s->prot)
+		return RFP_DONE;
+	s->start &= PAGE_MASK;
+	s->size &= PAGE_MASK;
 
-	if (start + size <= start)
-		return ret;
+	if (s->start + s->size <= s->start)
+		return RFP_DONE;
 
 	/* Does pgoff wrap? */
-	if (pgoff + (size >> PAGE_SHIFT) < pgoff)
-		return ret;
+	if (s->pgoff + (s->size >> PAGE_SHIFT) < s->pgoff)
+		return RFP_DONE;
 
-	if (mmap_read_lock_killable(mm))
-		return -EINTR;
+	if (mmap_read_lock_killable(s->mm)) {
+		*out = -EINTR;
+		return RFP_DONE;
+	}
 
 	/*
 	 * Look up VMA under read lock first so we can perform the security
 	 * without holding locks (which can be problematic). We reacquire a
 	 * write lock later and check nothing changed underneath us.
 	 */
-	vma = vma_lookup(mm, start);
+	s->vma = vma_lookup(s->mm, s->start);
 
-	if (!vma || !vma_test(vma, VMA_SHARED_BIT)) {
-		mmap_read_unlock(mm);
-		return -EINVAL;
+	if (!s->vma || !vma_test(s->vma, VMA_SHARED_BIT)) {
+		mmap_read_unlock(s->mm);
+		return RFP_DONE;
 	}
 
-	prot |= vma_test(vma, VMA_READ_BIT) ? PROT_READ : 0;
-	prot |= vma_test(vma, VMA_WRITE_BIT) ? PROT_WRITE : 0;
-	prot |= vma_test(vma, VMA_EXEC_BIT) ? PROT_EXEC : 0;
+	s->prot |= vma_test(s->vma, VMA_READ_BIT) ? PROT_READ : 0;
+	s->prot |= vma_test(s->vma, VMA_WRITE_BIT) ? PROT_WRITE : 0;
+	s->prot |= vma_test(s->vma, VMA_EXEC_BIT) ? PROT_EXEC : 0;
 
-	flags &= MAP_NONBLOCK;
-	flags |= MAP_SHARED | MAP_FIXED | MAP_POPULATE;
-	if (vma_test(vma, VMA_LOCKED_BIT))
-		flags |= MAP_LOCKED;
+	s->flags &= MAP_NONBLOCK;
+	s->flags |= MAP_SHARED | MAP_FIXED | MAP_POPULATE;
+	if (vma_test(s->vma, VMA_LOCKED_BIT))
+		s->flags |= MAP_LOCKED;
 
 	/* Save vm_flags used to calculate prot and flags, and recheck later. */
-	vm_flags = vma->vm_flags;
-	file = get_file(vma->vm_file);
+	s->vm_flags = s->vma->vm_flags;
+	s->file = get_file(s->vma->vm_file);
 
-	mmap_read_unlock(mm);
+	mmap_read_unlock(s->mm);
+	*out = 0;
+	return RFP_SEC;
+}
+
+static int rfp_security(struct rust_rfp_state *s, long *out)
+{
+	long ret;
 
 	/* Call outside mmap_lock to be consistent with other callers. */
-	ret = security_mmap_file(file, prot, flags);
+	ret = security_mmap_file(s->file, s->prot, s->flags);
 	if (ret) {
-		fput(file);
-		return ret;
+		fput(s->file);
+		s->file = NULL;
+		*out = ret;
+		return RFP_DONE;
 	}
+	return RFP_APPLY;
+}
 
-	ret = -EINVAL;
+static long rfp_apply(struct rust_rfp_state *s)
+{
+	struct mm_struct *mm = s->mm;
+	struct vm_area_struct *vma;
+	unsigned long start = s->start;
+	unsigned long size = s->size;
+	unsigned long ret = -EINVAL;
 
 	/* OK security check passed, take write lock + let it rip. */
 	if (mmap_write_lock_killable(mm)) {
-		fput(file);
+		fput(s->file);
+		s->file = NULL;
 		return -EINTR;
 	}
+	s->write_locked = true;
 
 	vma = vma_lookup(mm, start);
 
@@ -1458,9 +1492,9 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 		goto out;
 
 	/* Make sure things didn't change under us. */
-	if (vma->vm_flags != vm_flags)
+	if (vma->vm_flags != s->vm_flags)
 		goto out;
-	if (vma->vm_file != file)
+	if (vma->vm_file != s->file)
 		goto out;
 
 	if (start + size > vma->vm_end) {
@@ -1489,15 +1523,93 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 	}
 
 	ret = do_mmap(vma->vm_file, start, size,
-			prot, flags, EMPTY_VMA_FLAGS, pgoff, &populate, NULL);
+			s->prot, s->flags, EMPTY_VMA_FLAGS, s->pgoff,
+			&s->populate, NULL);
 out:
 	mmap_write_unlock(mm);
-	fput(file);
-	if (populate)
-		mm_populate(ret, populate);
+	s->write_locked = false;
+	fput(s->file);
+	s->file = NULL;
+	if (s->populate)
+		mm_populate(ret, s->populate);
 	if (!IS_ERR_VALUE(ret))
 		ret = 0;
 	return ret;
+}
+
+static void rfp_abort(struct rust_rfp_state *s)
+{
+	if (s->write_locked) {
+		mmap_write_unlock(s->mm);
+		s->write_locked = false;
+	}
+	if (s->file) {
+		fput(s->file);
+		s->file = NULL;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_rfp_classify(struct rust_rfp_state *s, long *out)
+{
+	return rfp_classify(s, out);
+}
+
+int rust_rfp_security(struct rust_rfp_state *s, long *out)
+{
+	return rfp_security(s, out);
+}
+
+long rust_rfp_apply(struct rust_rfp_state *s)
+{
+	return rfp_apply(s);
+}
+
+void rust_rfp_abort(struct rust_rfp_state *s)
+{
+	rfp_abort(s);
+}
+#endif
+
+static long finish_rfp(struct rust_rfp_state *s)
+{
+	long out = 0;
+	int kind;
+
+	kind = rfp_classify(s, &out);
+	if (kind == RFP_DONE)
+		return out;
+	kind = rfp_security(s, &out);
+	if (kind == RFP_DONE)
+		return out;
+	return rfp_apply(s);
+}
+
+SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
+		unsigned long, prot, unsigned long, pgoff, unsigned long, flags)
+{
+	struct rust_rfp_state s = {
+		.start = start,
+		.size = size,
+		.prot = prot,
+		.pgoff = pgoff,
+		.flags = flags,
+	};
+
+	pr_warn_once("%s (%d) uses deprecated remap_file_pages() syscall. See Documentation/mm/remap_file_pages.rst.\n",
+		     current->comm, current->pid);
+
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		long rust_ret;
+
+		rust_ret = rust_rfp_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_rfp(&s);
 }
 
 #define VMBRK_DONE		0
