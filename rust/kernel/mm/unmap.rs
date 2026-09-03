@@ -40,7 +40,10 @@
 //! and `acct_stack_growth` (limits vs security account),
 //! `vms_clean_up_area` (empty vs close), `vms_abort_munmap_vmas`
 //! (reattach vs gap), `__mmap_setup` (overlap gather vs limits),
-//! and `__mmap_new_file_vma` (no mmap vs file mmap). The
+//! and `__mmap_new_file_vma` (no mmap vs file mmap), `dup_anon_vma`
+//! (no-op vs clone), `find_mergeable_anon_vma` (next vs prev),
+//! `vma_link_file` (no file vs i_mmap link), and `__vm_munmap`
+//! (lock vs unmap). The
 //! VMA maple tree is a Rust RCU range array.
 //! File mmap/shmem / page-table walk / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
@@ -228,6 +231,26 @@ const MNF_DONE: i32 = 0;
 /// File has `.mmap`; invoke the driver callback.
 const MNF_MMAP: i32 = 1;
 
+/// Matches `RUST_DAV_*` in `include/linux/mm.h`.
+const DAV_DONE: i32 = 0;
+/// Destination has no anon_vma; clone from source.
+const DAV_CLONE: i32 = 1;
+
+/// Matches `RUST_FMA_*` in `include/linux/mm.h`.
+const FMA_DONE: i32 = 0;
+/// Next was missing or not reusable; try the previous VMA.
+const FMA_PREV: i32 = 1;
+
+/// Matches `RUST_VLF_*` in `include/linux/mm.h`.
+const VLF_DONE: i32 = 0;
+/// File-backed; lock i_mmap and insert.
+const VLF_LINK: i32 = 1;
+
+/// Matches `RUST_VMUNMAP_*` in `include/linux/mm.h`.
+const VMUNMAP_DONE: i32 = 0;
+/// mmap write lock held; unmap the range.
+const VMUNMAP_APPLY: i32 = 1;
+
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
 /// Range is valid; lock and walk VMAs.
@@ -399,6 +422,10 @@ static N_CLEAN: Atomic<u32> = Atomic::new(0);
 static N_VABORT: Atomic<u32> = Atomic::new(0);
 static N_MSET: Atomic<u32> = Atomic::new(0);
 static N_MNF: Atomic<u32> = Atomic::new(0);
+static N_DAV: Atomic<u32> = Atomic::new(0);
+static N_FMA: Atomic<u32> = Atomic::new(0);
+static N_VLF: Atomic<u32> = Atomic::new(0);
+static N_VMUNMAP: Atomic<u32> = Atomic::new(0);
 static N_VEX: Atomic<u32> = Atomic::new(0);
 static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
@@ -607,7 +634,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages/change_protection/expand_downwards/insert_vm_struct/split_vma/vma_link/copy_vma/do_vmi_align_munmap/unmap_region/install_special_mapping/vms_gather/vms_complete/acct_stack_growth/vms_clean_up/vms_abort/mmap_setup/mmap_new_file sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages/change_protection/expand_downwards/insert_vm_struct/split_vma/vma_link/copy_vma/do_vmi_align_munmap/unmap_region/install_special_mapping/vms_gather/vms_complete/acct_stack_growth/vms_clean_up/vms_abort/mmap_setup/mmap_new_file/dup_anon_vma/find_mergeable_anon_vma/vma_link_file/vm_munmap sequencer\n");
     crate::mm::mtree::announce_once();
 }
 
@@ -3147,6 +3174,177 @@ pub unsafe extern "C" fn rust_mnf_dispatch(
             pr_err!("rust-mmap: unknown __mmap_new_file_vma kind {kind}\n");
             // SAFETY: Drop a leftover file reference.
             unsafe { bindings::rust_mnf_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `dup_anon_vma` after C decides a clone is needed.
+///
+/// Sets `*handled` once classify has run. `anon_vma_clone` stays in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_dav_state` with `dst`/`src`/`dup` filled.
+/// mmap write lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_dav_dispatch(
+    s: *mut bindings::rust_dav_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify inspects anon_vma pointers.
+    let kind = unsafe { bindings::rust_dav_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_DAV.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first dup_anon_vma sequenced\n");
+    }
+
+    match kind {
+        DAV_DONE => out,
+        // SAFETY: Destination is unfaulted; clone in C.
+        DAV_CLONE => unsafe { bindings::rust_dav_clone(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown dup_anon_vma kind {kind}\n");
+            unsafe { bindings::rust_dav_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `find_mergeable_anon_vma` after C tries the next VMA.
+///
+/// Sets `*handled` once classify has run. Previous-VMA lookup stays in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_fma_state` with `vma` filled. mmap lock
+/// held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_fma_dispatch(
+    s: *mut bindings::rust_fma_state,
+    handled: *mut c_int,
+) -> *mut bindings::anon_vma {
+    if s.is_null() || handled.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut ret = ptr::null_mut();
+    // SAFETY: `s` is live; classify may walk the next VMA.
+    let kind = unsafe { bindings::rust_fma_classify(s, &mut ret) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_FMA.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first find_mergeable_anon_vma sequenced\n");
+    }
+
+    match kind {
+        FMA_DONE => ret,
+        // SAFETY: Next was missing or not reusable; try prev in C.
+        FMA_PREV => unsafe { bindings::rust_fma_prev(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown find_mergeable_anon_vma kind {kind}\n");
+            unsafe { bindings::rust_fma_abort(s) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// C ABI: sequence `vma_link_file` after C checks for a backing file.
+///
+/// Sets `*handled` once classify has run. i_mmap insert stays in C.
+/// Unknown kind drops a leftover i_mmap write lock.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vlf_state` with `vma`/`hold_rmap_lock`
+/// filled. mmap write lock held. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vlf_dispatch(
+    s: *mut bindings::rust_vlf_state,
+    handled: *mut c_int,
+) {
+    if s.is_null() || handled.is_null() {
+        return;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: `s` is live; classify checks `vma->vm_file`.
+    let kind = unsafe { bindings::rust_vlf_classify(s) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VLF.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_link_file sequenced\n");
+    }
+
+    match kind {
+        VLF_DONE => {}
+        // SAFETY: File-backed; lock and insert in C.
+        VLF_LINK => unsafe { bindings::rust_vlf_link(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vma_link_file kind {kind}\n");
+            unsafe { bindings::rust_vlf_abort(s) };
+        }
+    }
+}
+
+/// C ABI: sequence `__vm_munmap` after C takes the mmap write lock.
+///
+/// Sets `*handled` once classify has run. Maple unmap stays in C.
+/// Unknown kind drops a leftover mmap write lock.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vmunmap_state` with `start`/`len`/`unlock`
+/// filled. No mmap lock is held on entry. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vmunmap_dispatch(
+    s: *mut bindings::rust_vmunmap_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may take the mmap write lock.
+    let kind = unsafe { bindings::rust_vmunmap_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VMUNMAP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first __vm_munmap sequenced\n");
+    }
+
+    match kind {
+        VMUNMAP_DONE => out,
+        // SAFETY: Lock held; unmap in C.
+        VMUNMAP_APPLY => unsafe { bindings::rust_vmunmap_apply(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown __vm_munmap kind {kind}\n");
+            // SAFETY: Drop a leftover mmap write lock.
+            unsafe { bindings::rust_vmunmap_abort(s) };
             EINVAL.to_errno()
         }
     }

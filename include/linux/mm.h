@@ -4501,6 +4501,34 @@ int rust_mnf_dispatch(struct rust_mnf_state *s, int *handled);
 int rust_mnf_classify(struct rust_mnf_state *s, int *out);
 int rust_mnf_mmap(struct rust_mnf_state *s);
 void rust_mnf_abort(struct rust_mnf_state *s);
+struct rust_dav_state;
+#define RUST_DAV_DONE		0
+#define RUST_DAV_CLONE		1
+int rust_dav_dispatch(struct rust_dav_state *s, int *handled);
+int rust_dav_classify(struct rust_dav_state *s, int *out);
+int rust_dav_clone(struct rust_dav_state *s);
+void rust_dav_abort(struct rust_dav_state *s);
+struct rust_fma_state;
+#define RUST_FMA_DONE		0
+#define RUST_FMA_PREV		1
+struct anon_vma *rust_fma_dispatch(struct rust_fma_state *s, int *handled);
+int rust_fma_classify(struct rust_fma_state *s, struct anon_vma **ret);
+struct anon_vma *rust_fma_prev(struct rust_fma_state *s);
+void rust_fma_abort(struct rust_fma_state *s);
+struct rust_vlf_state;
+#define RUST_VLF_DONE		0
+#define RUST_VLF_LINK		1
+void rust_vlf_dispatch(struct rust_vlf_state *s, int *handled);
+int rust_vlf_classify(struct rust_vlf_state *s);
+void rust_vlf_link(struct rust_vlf_state *s);
+void rust_vlf_abort(struct rust_vlf_state *s);
+struct rust_vmunmap_state;
+#define RUST_VMUNMAP_DONE	0
+#define RUST_VMUNMAP_APPLY	1
+int rust_vmunmap_dispatch(struct rust_vmunmap_state *s, int *handled);
+int rust_vmunmap_classify(struct rust_vmunmap_state *s, int *out);
+int rust_vmunmap_apply(struct rust_vmunmap_state *s);
+void rust_vmunmap_abort(struct rust_vmunmap_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;

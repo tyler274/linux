@@ -807,9 +807,18 @@ static int split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
  *
  * Returns: 0 on success.
  */
-static int dup_anon_vma(struct vm_area_struct *dst,
-			struct vm_area_struct *src, struct vm_area_struct **dup)
+#define DAV_DONE		0
+#define DAV_CLONE		1
+
+struct rust_dav_state {
+	struct vm_area_struct *dst;
+	struct vm_area_struct *src;
+	struct vm_area_struct **dup;
+};
+
+static int dav_classify(struct rust_dav_state *s, int *out)
 {
+	*out = 0;
 	/*
 	 * There are three cases to consider for correctly propagating
 	 * anon_vma's on merge.
@@ -824,19 +833,75 @@ static int dup_anon_vma(struct vm_area_struct *dst,
 	 * that is it is unfaulted, we need to ensure that the newly merged
 	 * range is referenced by the anon_vma's of the source.
 	 */
-	if (src->anon_vma && !dst->anon_vma) {
-		int ret;
+	if (s->src->anon_vma && !s->dst->anon_vma)
+		return DAV_CLONE;
+	return DAV_DONE;
+}
 
-		vma_assert_write_locked(dst);
-		dst->anon_vma = src->anon_vma;
-		ret = anon_vma_clone(dst, src, VMA_OP_MERGE_UNFAULTED);
-		if (ret)
-			return ret;
+static int dav_clone(struct rust_dav_state *s)
+{
+	int ret;
 
-		*dup = dst;
-	}
+	vma_assert_write_locked(s->dst);
+	s->dst->anon_vma = s->src->anon_vma;
+	ret = anon_vma_clone(s->dst, s->src, VMA_OP_MERGE_UNFAULTED);
+	if (ret)
+		return ret;
 
+	*s->dup = s->dst;
 	return 0;
+}
+
+static void dav_abort(struct rust_dav_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_dav_classify(struct rust_dav_state *s, int *out)
+{
+	return dav_classify(s, out);
+}
+
+int rust_dav_clone(struct rust_dav_state *s)
+{
+	return dav_clone(s);
+}
+
+void rust_dav_abort(struct rust_dav_state *s)
+{
+	dav_abort(s);
+}
+#endif
+
+static int finish_dav(struct rust_dav_state *s)
+{
+	int out = 0;
+
+	if (dav_classify(s, &out) == DAV_DONE)
+		return out;
+	return dav_clone(s);
+}
+
+static int dup_anon_vma(struct vm_area_struct *dst,
+			struct vm_area_struct *src, struct vm_area_struct **dup)
+{
+	struct rust_dav_state s = {
+		.dst = dst,
+		.src = src,
+		.dup = dup,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_dav_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_dav(&s);
 }
 
 #ifdef CONFIG_DEBUG_VM_MAPLE_TREE
@@ -2799,18 +2864,87 @@ void unlink_file_vma_batch_final(struct unlink_vma_file_batch *vb)
 		unlink_file_vma_batch_process(vb);
 }
 
+#define VLF_DONE		0
+#define VLF_LINK		1
+
+struct rust_vlf_state {
+	struct vm_area_struct *vma;
+	bool hold_rmap_lock;
+	struct address_space *mapping;
+	bool need_unlock;
+};
+
+static int vlf_classify(struct rust_vlf_state *s)
+{
+	s->mapping = NULL;
+	s->need_unlock = false;
+	if (!s->vma->vm_file)
+		return VLF_DONE;
+	return VLF_LINK;
+}
+
+static void vlf_link(struct rust_vlf_state *s)
+{
+	struct file *file = s->vma->vm_file;
+
+	s->mapping = file->f_mapping;
+	i_mmap_lock_write(s->mapping);
+	s->need_unlock = !s->hold_rmap_lock;
+	__vma_link_file(s->vma, s->mapping);
+	if (!s->hold_rmap_lock) {
+		i_mmap_unlock_write(s->mapping);
+		s->need_unlock = false;
+	}
+}
+
+static void vlf_abort(struct rust_vlf_state *s)
+{
+	if (s->need_unlock && s->mapping) {
+		i_mmap_unlock_write(s->mapping);
+		s->need_unlock = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vlf_classify(struct rust_vlf_state *s)
+{
+	return vlf_classify(s);
+}
+
+void rust_vlf_link(struct rust_vlf_state *s)
+{
+	vlf_link(s);
+}
+
+void rust_vlf_abort(struct rust_vlf_state *s)
+{
+	vlf_abort(s);
+}
+#endif
+
+static void finish_vlf(struct rust_vlf_state *s)
+{
+	if (vlf_classify(s) == VLF_DONE)
+		return;
+	vlf_link(s);
+}
+
 static void vma_link_file(struct vm_area_struct *vma, bool hold_rmap_lock)
 {
-	struct file *file = vma->vm_file;
-	struct address_space *mapping;
+	struct rust_vlf_state s = {
+		.vma = vma,
+		.hold_rmap_lock = hold_rmap_lock,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
 
-	if (file) {
-		mapping = file->f_mapping;
-		i_mmap_lock_write(mapping);
-		__vma_link_file(vma, mapping);
-		if (!hold_rmap_lock)
-			i_mmap_unlock_write(mapping);
+		rust_vlf_dispatch(&s, &handled);
+		if (handled)
+			return;
 	}
+#endif
+	finish_vlf(&s);
 }
 
 #define VLINK_DONE		0
@@ -3183,23 +3317,44 @@ static struct anon_vma *reusable_anon_vma(struct vm_area_struct *old,
  * anon_vmas being allocated, preventing vma merge in subsequent
  * mprotect.
  */
-struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma)
+#define FMA_DONE		0
+#define FMA_PREV		1
+
+struct rust_fma_state {
+	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
+};
+
+static int fma_classify(struct rust_fma_state *s, struct anon_vma **ret)
 {
-	struct anon_vma *anon_vma = NULL;
-	struct vm_area_struct *prev, *next;
-	VMA_ITERATOR(vmi, vma->vm_mm, vma->vm_end);
+	struct vm_area_struct *vma = s->vma;
+	struct vm_area_struct *next;
+	struct anon_vma *anon_vma;
+
+	*ret = NULL;
+	vma_iter_init(&s->vmi, vma->vm_mm, vma->vm_end);
 
 	/* Try next first. */
-	next = vma_iter_load(&vmi);
+	next = vma_iter_load(&s->vmi);
 	if (next) {
 		anon_vma = reusable_anon_vma(next, vma, next);
-		if (anon_vma)
-			return anon_vma;
+		if (anon_vma) {
+			*ret = anon_vma;
+			return FMA_DONE;
+		}
 	}
+	return FMA_PREV;
+}
 
-	prev = vma_prev(&vmi);
+static struct anon_vma *fma_prev(struct rust_fma_state *s)
+{
+	struct vm_area_struct *vma = s->vma;
+	struct vm_area_struct *prev;
+	struct anon_vma *anon_vma = NULL;
+
+	prev = vma_prev(&s->vmi);
 	VM_BUG_ON_VMA(prev != vma, vma);
-	prev = vma_prev(&vmi);
+	prev = vma_prev(&s->vmi);
 	/* Try prev next. */
 	if (prev)
 		anon_vma = reusable_anon_vma(prev, prev, vma);
@@ -3215,6 +3370,55 @@ struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma)
 	 * not trying to minimize memory used for anon_vmas.
 	 */
 	return anon_vma;
+}
+
+static void fma_abort(struct rust_fma_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_fma_classify(struct rust_fma_state *s, struct anon_vma **ret)
+{
+	return fma_classify(s, ret);
+}
+
+struct anon_vma *rust_fma_prev(struct rust_fma_state *s)
+{
+	return fma_prev(s);
+}
+
+void rust_fma_abort(struct rust_fma_state *s)
+{
+	fma_abort(s);
+}
+#endif
+
+static struct anon_vma *finish_fma(struct rust_fma_state *s)
+{
+	struct anon_vma *ret = NULL;
+
+	if (fma_classify(s, &ret) == FMA_DONE)
+		return ret;
+	return fma_prev(s);
+}
+
+struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma)
+{
+	struct rust_fma_state s = {
+		.vma = vma,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		struct anon_vma *rust_ret;
+
+		rust_ret = rust_fma_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_fma(&s);
 }
 
 static bool vm_ops_needs_writenotify(const struct vm_operations_struct *vm_ops)
@@ -5234,22 +5438,100 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
 	return finish_exdn(&s);
 }
 
-int __vm_munmap(unsigned long start, size_t len, bool unlock)
+#define VMUNMAP_DONE		0
+#define VMUNMAP_APPLY		1
+
+struct rust_vmunmap_state {
+	unsigned long start;
+	size_t len;
+	bool unlock;
+	struct mm_struct *mm;
+	struct list_head uf;
+	struct vma_iterator vmi;
+	bool locked;
+};
+
+static int vmunmap_classify(struct rust_vmunmap_state *s, int *out)
+{
+	*out = 0;
+	s->locked = false;
+	s->mm = current->mm;
+	INIT_LIST_HEAD(&s->uf);
+	vma_iter_init(&s->vmi, s->mm, s->start);
+
+	if (mmap_write_lock_killable(s->mm)) {
+		*out = -EINTR;
+		return VMUNMAP_DONE;
+	}
+	s->locked = true;
+	return VMUNMAP_APPLY;
+}
+
+static int vmunmap_apply(struct rust_vmunmap_state *s)
 {
 	int ret;
-	struct mm_struct *mm = current->mm;
-	LIST_HEAD(uf);
-	VMA_ITERATOR(vmi, mm, start);
 
-	if (mmap_write_lock_killable(mm))
-		return -EINTR;
+	ret = do_vmi_munmap(&s->vmi, s->mm, s->start, s->len, &s->uf, s->unlock);
+	if (ret || !s->unlock)
+		mmap_write_unlock(s->mm);
+	s->locked = false;
 
-	ret = do_vmi_munmap(&vmi, mm, start, len, &uf, unlock);
-	if (ret || !unlock)
-		mmap_write_unlock(mm);
-
-	userfaultfd_unmap_complete(mm, &uf);
+	userfaultfd_unmap_complete(s->mm, &s->uf);
 	return ret;
+}
+
+static void vmunmap_abort(struct rust_vmunmap_state *s)
+{
+	if (s->locked) {
+		mmap_write_unlock(s->mm);
+		s->locked = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vmunmap_classify(struct rust_vmunmap_state *s, int *out)
+{
+	return vmunmap_classify(s, out);
+}
+
+int rust_vmunmap_apply(struct rust_vmunmap_state *s)
+{
+	return vmunmap_apply(s);
+}
+
+void rust_vmunmap_abort(struct rust_vmunmap_state *s)
+{
+	vmunmap_abort(s);
+}
+#endif
+
+static int finish_vmunmap(struct rust_vmunmap_state *s)
+{
+	int out = 0;
+
+	if (vmunmap_classify(s, &out) == VMUNMAP_DONE)
+		return out;
+	return vmunmap_apply(s);
+}
+
+int __vm_munmap(unsigned long start, size_t len, bool unlock)
+{
+	struct rust_vmunmap_state s = {
+		.start = start,
+		.len = len,
+		.unlock = unlock,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_vmunmap_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_vmunmap(&s);
 }
 
 /*
