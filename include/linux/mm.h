@@ -4389,6 +4389,20 @@ struct vm_area_struct *rust_estk_dispatch(struct rust_estk_state *s,
 int rust_estk_classify(struct rust_estk_state *s);
 struct vm_area_struct *rust_estk_downgrade(struct rust_estk_state *s);
 void rust_estk_abort(struct rust_estk_state *s);
+struct rust_exdn_state;
+#define RUST_EXDN_DONE		0
+#define RUST_EXDN_APPLY		1
+int rust_exdn_dispatch(struct rust_exdn_state *s, int *handled);
+int rust_exdn_classify(struct rust_exdn_state *s, int *out);
+int rust_exdn_apply(struct rust_exdn_state *s);
+void rust_exdn_abort(struct rust_exdn_state *s);
+struct rust_ivs_state;
+#define RUST_IVS_DONE		0
+#define RUST_IVS_LINK		1
+int rust_ivs_dispatch(struct rust_ivs_state *s, int *handled);
+int rust_ivs_classify(struct rust_ivs_state *s, int *out);
+int rust_ivs_link(struct rust_ivs_state *s);
+void rust_ivs_abort(struct rust_ivs_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;
@@ -4524,6 +4538,14 @@ int rust_mpfix_dispatch(struct rust_mpfix_state *s, int *handled);
 int rust_mpfix_prepare(struct rust_mpfix_state *s, int *out);
 int rust_mpfix_modify(struct rust_mpfix_state *s, int *out);
 int rust_mpfix_apply(struct rust_mpfix_state *s);
+struct rust_cp_state;
+#define RUST_CP_DONE		0
+#define RUST_CP_HUGE		1
+#define RUST_CP_RANGE		2
+long rust_cp_dispatch(struct rust_cp_state *s, int *handled);
+int rust_cp_classify(struct rust_cp_state *s, long *out);
+long rust_cp_huge(struct rust_cp_state *s);
+long rust_cp_range(struct rust_cp_state *s);
 #ifdef CONFIG_64BIT
 struct rust_mseal_req {
 	unsigned long start;

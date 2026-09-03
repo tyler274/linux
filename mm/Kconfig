@@ -234,10 +234,13 @@ config RUST_MMAP
 	  both/left/right), vma_expand (dup vs commit), expand_stack
 	  (found vs grow-up vs grow-down), vma_modify (merge vs split),
 	  vma_shrink (prealloc vs apply), commit_merge (prealloc vs
-	  apply), and remap_file_pages (validate vs LSM vs do_mmap).
+	  apply), remap_file_pages (validate vs LSM vs do_mmap),
+	  change_protection (hugetlb vs page-table range),
+	  expand_downwards (prealloc vs grow), and insert_vm_struct
+	  (account vs maple link).
 	  The VMA maple tree is a Rust RCU range array; irq and
 	  other maple trees stay in C.
-	  File mmap/shmem bodies stay in C.
+	  File mmap/shmem and page-table walk bodies stay in C.
 
 	  If unsure, say N.
 

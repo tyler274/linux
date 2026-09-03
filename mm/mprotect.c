@@ -683,23 +683,34 @@ static long change_protection_range(struct mmu_gather *tlb,
 	return pages;
 }
 
-long change_protection(struct mmu_gather *tlb,
-		       struct vm_area_struct *vma, unsigned long start,
-		       unsigned long end, unsigned long cp_flags)
+#define CP_DONE			0
+#define CP_HUGE			1
+#define CP_RANGE		2
+
+struct rust_cp_state {
+	struct mmu_gather *tlb;
+	struct vm_area_struct *vma;
+	unsigned long start;
+	unsigned long end;
+	unsigned long cp_flags;
+	pgprot_t newprot;
+};
+
+static int cp_classify(struct rust_cp_state *s, long *out)
 {
-	pgprot_t newprot = vma->vm_page_prot;
-	long pages;
+	*out = 0;
+	s->newprot = s->vma->vm_page_prot;
 
 	/*
 	 * MM_CP_UFFD_{WP,RWP} and _RESOLVE are mutually exclusive within one
 	 * change, and WP and RWP cannot mix. Miswired callers get a warn and
 	 * a no-op; userspace cannot reach this state.
 	 */
-	if (WARN_ON_ONCE((cp_flags & MM_CP_UFFD_WP_ALL) == MM_CP_UFFD_WP_ALL ||
-			 (cp_flags & MM_CP_UFFD_RWP_ALL) == MM_CP_UFFD_RWP_ALL ||
-			 ((cp_flags & MM_CP_UFFD_WP_ALL) &&
-			  (cp_flags & MM_CP_UFFD_RWP_ALL))))
-		return 0;
+	if (WARN_ON_ONCE((s->cp_flags & MM_CP_UFFD_WP_ALL) == MM_CP_UFFD_WP_ALL ||
+			 (s->cp_flags & MM_CP_UFFD_RWP_ALL) == MM_CP_UFFD_RWP_ALL ||
+			 ((s->cp_flags & MM_CP_UFFD_WP_ALL) &&
+			  (s->cp_flags & MM_CP_UFFD_RWP_ALL))))
+		return CP_DONE;
 
 #ifdef CONFIG_NUMA_BALANCING
 	/*
@@ -707,24 +718,86 @@ long change_protection(struct mmu_gather *tlb,
 	 * are expected to reflect their requirements via VMA flags such that
 	 * vma_set_page_prot() will adjust vma->vm_page_prot accordingly.
 	 */
-	if (cp_flags & MM_CP_PROT_NUMA)
-		newprot = PAGE_NONE;
+	if (s->cp_flags & MM_CP_PROT_NUMA)
+		s->newprot = PAGE_NONE;
 #else
-	WARN_ON_ONCE(cp_flags & MM_CP_PROT_NUMA);
+	WARN_ON_ONCE(s->cp_flags & MM_CP_PROT_NUMA);
 #endif
 
 	if (IS_ENABLED(CONFIG_ARCH_HAS_PTE_PROTNONE) &&
-	    (cp_flags & MM_CP_UFFD_RWP))
-		newprot = PAGE_NONE;
+	    (s->cp_flags & MM_CP_UFFD_RWP))
+		s->newprot = PAGE_NONE;
 
-	if (is_vm_hugetlb_page(vma))
-		pages = hugetlb_change_protection(vma, start, end, newprot,
-						  cp_flags);
-	else
-		pages = change_protection_range(tlb, vma, start, end, newprot,
-						cp_flags);
+	if (is_vm_hugetlb_page(s->vma))
+		return CP_HUGE;
+	return CP_RANGE;
+}
 
-	return pages;
+static long cp_huge(struct rust_cp_state *s)
+{
+	return hugetlb_change_protection(s->vma, s->start, s->end, s->newprot,
+					 s->cp_flags);
+}
+
+static long cp_range(struct rust_cp_state *s)
+{
+	return change_protection_range(s->tlb, s->vma, s->start, s->end,
+				       s->newprot, s->cp_flags);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_cp_classify(struct rust_cp_state *s, long *out)
+{
+	return cp_classify(s, out);
+}
+
+long rust_cp_huge(struct rust_cp_state *s)
+{
+	return cp_huge(s);
+}
+
+long rust_cp_range(struct rust_cp_state *s)
+{
+	return cp_range(s);
+}
+#endif
+
+static long finish_cp(struct rust_cp_state *s)
+{
+	long out = 0;
+
+	switch (cp_classify(s, &out)) {
+	case CP_DONE:
+		return out;
+	case CP_HUGE:
+		return cp_huge(s);
+	default:
+		return cp_range(s);
+	}
+}
+
+long change_protection(struct mmu_gather *tlb,
+		       struct vm_area_struct *vma, unsigned long start,
+		       unsigned long end, unsigned long cp_flags)
+{
+	struct rust_cp_state s = {
+		.tlb = tlb,
+		.vma = vma,
+		.start = start,
+		.end = end,
+		.cp_flags = cp_flags,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		long rust_ret;
+
+		rust_ret = rust_cp_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_cp(&s);
 }
 
 static int prot_none_pte_entry(pte_t *pte, unsigned long addr,

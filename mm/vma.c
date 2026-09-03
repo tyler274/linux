@@ -4144,44 +4144,80 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
  * vma is the first one with address < vma->vm_start.  Have to extend vma.
  * mmap_lock held for writing.
  */
-int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+#define EXDN_DONE		0
+#define EXDN_APPLY		1
+
+struct rust_exdn_state {
+	struct vm_area_struct *vma;
+	unsigned long address;
+	struct mm_struct *mm;
+	struct vma_iterator vmi;
+	bool prealloced;
+};
+
+static int exdn_classify(struct rust_exdn_state *s, int *out)
 {
+	struct vm_area_struct *vma = s->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *prev;
-	int error = 0;
-	VMA_ITERATOR(vmi, mm, vma->vm_start);
 
-	if (!vma_test(vma, VMA_GROWSDOWN_BIT))
-		return -EFAULT;
+	s->mm = mm;
+	s->prealloced = false;
+	*out = 0;
+
+	if (!vma_test(vma, VMA_GROWSDOWN_BIT)) {
+		*out = -EFAULT;
+		return EXDN_DONE;
+	}
 
 	mmap_assert_write_locked(mm);
 
-	address &= PAGE_MASK;
-	if (address < mmap_min_addr || address < FIRST_USER_ADDRESS)
-		return -EPERM;
+	s->address &= PAGE_MASK;
+	if (s->address < mmap_min_addr || s->address < FIRST_USER_ADDRESS) {
+		*out = -EPERM;
+		return EXDN_DONE;
+	}
+
+	vma_iter_init(&s->vmi, mm, vma->vm_start);
 
 	/* Enforce stack_guard_gap */
-	prev = vma_prev(&vmi);
+	prev = vma_prev(&s->vmi);
 	/* Check that both stack segments have the same anon_vma? */
 	if (prev) {
 		if (!vma_test(prev, VMA_GROWSDOWN_BIT) &&
 		    vma_is_accessible(prev) &&
-		    (address - prev->vm_end < stack_guard_gap))
-			return -ENOMEM;
+		    (s->address - prev->vm_end < stack_guard_gap)) {
+			*out = -ENOMEM;
+			return EXDN_DONE;
+		}
 	}
 
 	if (prev)
-		vma_iter_next_range_limit(&vmi, vma->vm_start);
+		vma_iter_next_range_limit(&s->vmi, vma->vm_start);
 
-	vma_iter_config(&vmi, address, vma->vm_end);
-	if (vma_iter_prealloc(&vmi, vma))
-		return -ENOMEM;
+	vma_iter_config(&s->vmi, s->address, vma->vm_end);
+	if (vma_iter_prealloc(&s->vmi, vma)) {
+		*out = -ENOMEM;
+		return EXDN_DONE;
+	}
+	s->prealloced = true;
 
 	/* We must make sure the anon_vma is allocated. */
 	if (unlikely(anon_vma_prepare(vma))) {
-		vma_iter_free(&vmi);
-		return -ENOMEM;
+		vma_iter_free(&s->vmi);
+		s->prealloced = false;
+		*out = -ENOMEM;
+		return EXDN_DONE;
 	}
+	return EXDN_APPLY;
+}
+
+static int exdn_apply(struct rust_exdn_state *s)
+{
+	struct vm_area_struct *vma = s->vma;
+	struct mm_struct *mm = s->mm;
+	unsigned long address = s->address;
+	int error = 0;
 
 	/* Lock the VMA before expanding to prevent concurrent page faults */
 	vma_start_write(vma);
@@ -4204,7 +4240,7 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
 				vma->vm_start = address;
 				vma_sub_pgoff(vma, grow);
 				/* Overwrite old entry in mtree. */
-				vma_iter_store_overwrite(&vmi, vma);
+				vma_iter_store_overwrite(&s->vmi, vma);
 				anon_rmap_tree_post_update_vma(vma);
 
 				perf_event_mmap(vma);
@@ -4212,9 +4248,63 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
 		}
 	}
 	anon_vma_unlock_write(vma->anon_vma);
-	vma_iter_free(&vmi);
+	vma_iter_free(&s->vmi);
+	s->prealloced = false;
 	validate_mm(mm);
 	return error;
+}
+
+static void exdn_abort(struct rust_exdn_state *s)
+{
+	if (s->prealloced) {
+		vma_iter_free(&s->vmi);
+		s->prealloced = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_exdn_classify(struct rust_exdn_state *s, int *out)
+{
+	return exdn_classify(s, out);
+}
+
+int rust_exdn_apply(struct rust_exdn_state *s)
+{
+	return exdn_apply(s);
+}
+
+void rust_exdn_abort(struct rust_exdn_state *s)
+{
+	exdn_abort(s);
+}
+#endif
+
+static int finish_exdn(struct rust_exdn_state *s)
+{
+	int out = 0;
+
+	if (exdn_classify(s, &out) == EXDN_DONE)
+		return out;
+	return exdn_apply(s);
+}
+
+int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+{
+	struct rust_exdn_state s = {
+		.vma = vma,
+		.address = address,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_exdn_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_exdn(&s);
 }
 
 int __vm_munmap(unsigned long start, size_t len, bool unlock)
@@ -4239,16 +4329,34 @@ int __vm_munmap(unsigned long start, size_t len, bool unlock)
  * Insert vm structure into process list sorted by address
  * and into the inode's i_mmap tree if file-backed.
  */
-int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+#define IVS_DONE		0
+#define IVS_LINK		1
+
+struct rust_ivs_state {
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	unsigned long charged;
+	bool acct;
+};
+
+static int ivs_classify(struct rust_ivs_state *s, int *out)
 {
-	unsigned long charged = vma_pages(vma);
+	*out = 0;
+	s->charged = vma_pages(s->vma);
+	s->acct = false;
 
-	if (find_vma_intersection(mm, vma->vm_start, vma->vm_end))
-		return -ENOMEM;
+	if (find_vma_intersection(s->mm, s->vma->vm_start, s->vma->vm_end)) {
+		*out = -ENOMEM;
+		return IVS_DONE;
+	}
 
-	if (vma_test(vma, VMA_ACCOUNT_BIT) &&
-	     security_vm_enough_memory_mm(mm, charged))
-		return -ENOMEM;
+	if (vma_test(s->vma, VMA_ACCOUNT_BIT)) {
+		if (security_vm_enough_memory_mm(s->mm, s->charged)) {
+			*out = -ENOMEM;
+			return IVS_DONE;
+		}
+		s->acct = true;
+	}
 
 	/*
 	 * The vm_pgoff of a purely anonymous vma should be irrelevant
@@ -4262,19 +4370,77 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 	 * using the existing file pgoff checks and manipulations.
 	 * Similarly in do_mmap and in do_brk_flags.
 	 */
-	if (vma_is_anonymous(vma)) {
-		WARN_ON_ONCE(vma->anon_vma);
-		vma_set_pgoff(vma, vma->vm_start >> PAGE_SHIFT);
+	if (vma_is_anonymous(s->vma)) {
+		WARN_ON_ONCE(s->vma->anon_vma);
+		vma_set_pgoff(s->vma, s->vma->vm_start >> PAGE_SHIFT);
 	}
-	vma_set_anon_pgoff(vma, vma->vm_start >> PAGE_SHIFT);
+	vma_set_anon_pgoff(s->vma, s->vma->vm_start >> PAGE_SHIFT);
+	return IVS_LINK;
+}
 
-	if (vma_link(mm, vma)) {
-		if (vma_test(vma, VMA_ACCOUNT_BIT))
-			vm_unacct_memory(charged);
+static int ivs_link(struct rust_ivs_state *s)
+{
+	if (vma_link(s->mm, s->vma)) {
+		if (s->acct)
+			vm_unacct_memory(s->charged);
+		s->acct = false;
 		return -ENOMEM;
 	}
-
+	s->acct = false;
 	return 0;
+}
+
+static void ivs_abort(struct rust_ivs_state *s)
+{
+	if (s->acct) {
+		vm_unacct_memory(s->charged);
+		s->acct = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_ivs_classify(struct rust_ivs_state *s, int *out)
+{
+	return ivs_classify(s, out);
+}
+
+int rust_ivs_link(struct rust_ivs_state *s)
+{
+	return ivs_link(s);
+}
+
+void rust_ivs_abort(struct rust_ivs_state *s)
+{
+	ivs_abort(s);
+}
+#endif
+
+static int finish_ivs(struct rust_ivs_state *s)
+{
+	int out = 0;
+
+	if (ivs_classify(s, &out) == IVS_DONE)
+		return out;
+	return ivs_link(s);
+}
+
+int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+{
+	struct rust_ivs_state s = {
+		.mm = mm,
+		.vma = vma,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_ivs_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_ivs(&s);
 }
 
 /**
