@@ -522,17 +522,82 @@ void remove_vma(struct vm_area_struct *vma)
  *
  * Called with the mm semaphore held.
  */
+#define UR_DONE			0
+#define UR_APPLY		1
+
+struct rust_ur_state {
+	struct unmap_desc *unmap;
+	struct mm_struct *mm;
+	struct mmu_gather tlb;
+	bool gathered;
+};
+
+static int ur_classify(struct rust_ur_state *s)
+{
+	s->mm = s->unmap->first->vm_mm;
+	s->gathered = false;
+	tlb_gather_mmu(&s->tlb, s->mm);
+	s->gathered = true;
+	update_hiwater_rss(s->mm);
+	return UR_APPLY;
+}
+
+static void ur_apply(struct rust_ur_state *s)
+{
+	unmap_vmas(&s->tlb, s->unmap);
+	mas_set(s->unmap->mas, s->unmap->tree_reset);
+	free_pgtables(&s->tlb, s->unmap);
+	tlb_finish_mmu(&s->tlb);
+	s->gathered = false;
+}
+
+static void ur_abort(struct rust_ur_state *s)
+{
+	if (s->gathered) {
+		tlb_finish_mmu(&s->tlb);
+		s->gathered = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_ur_classify(struct rust_ur_state *s)
+{
+	return ur_classify(s);
+}
+
+void rust_ur_apply(struct rust_ur_state *s)
+{
+	ur_apply(s);
+}
+
+void rust_ur_abort(struct rust_ur_state *s)
+{
+	ur_abort(s);
+}
+#endif
+
+static void finish_ur(struct rust_ur_state *s)
+{
+	if (ur_classify(s) == UR_DONE)
+		return;
+	ur_apply(s);
+}
+
 void unmap_region(struct unmap_desc *unmap)
 {
-	struct mm_struct *mm = unmap->first->vm_mm;
-	struct mmu_gather tlb;
+	struct rust_ur_state s = {
+		.unmap = unmap,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
 
-	tlb_gather_mmu(&tlb, mm);
-	update_hiwater_rss(mm);
-	unmap_vmas(&tlb, unmap);
-	mas_set(unmap->mas, unmap->tree_reset);
-	free_pgtables(&tlb, unmap);
-	tlb_finish_mmu(&tlb);
+		rust_ur_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_ur(&s);
 }
 
 /*
@@ -1844,20 +1909,41 @@ static void vms_clean_up_area(struct vma_munmap_struct *vms,
  * used for the munmap() and may downgrade the lock - if requested.  Everything
  * needed to be done once the vma maple tree is updated.
  */
-static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
-		struct ma_state *mas_detach)
-{
-	struct vm_area_struct *vma;
-	struct mm_struct *mm;
+#define VCOMP_DONE		0
+#define VCOMP_UNMAP		1
 
-	mm = current->mm;
+struct rust_vcomp_state {
+	struct vma_munmap_struct *vms;
+	struct ma_state *mas_detach;
+	struct mm_struct *mm;
+	bool need_unmap;
+};
+
+static int vcomp_classify(struct rust_vcomp_state *s)
+{
+	struct vma_munmap_struct *vms = s->vms;
+	struct mm_struct *mm = current->mm;
+
+	s->mm = mm;
+	s->need_unmap = false;
 	mm->map_count -= vms->vma_count;
 	mm->locked_vm -= vms->locked_vm;
 	if (vms->unlock)
 		mmap_write_downgrade(mm);
 
 	if (!vms->nr_pages)
-		return;
+		return VCOMP_DONE;
+
+	s->need_unmap = true;
+	return VCOMP_UNMAP;
+}
+
+static void vcomp_unmap(struct rust_vcomp_state *s)
+{
+	struct vma_munmap_struct *vms = s->vms;
+	struct ma_state *mas_detach = s->mas_detach;
+	struct mm_struct *mm = s->mm;
+	struct vm_area_struct *vma;
 
 	vms_clear_ptes(vms, mas_detach, !vms->unlock);
 	/* Update high watermark before we lower total_vm */
@@ -1883,6 +1969,56 @@ static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
 		mmap_read_unlock(mm);
 
 	__mt_destroy(mas_detach->tree);
+	s->need_unmap = false;
+}
+
+static void vcomp_abort(struct rust_vcomp_state *s)
+{
+	if (s->need_unmap)
+		vcomp_unmap(s);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vcomp_classify(struct rust_vcomp_state *s)
+{
+	return vcomp_classify(s);
+}
+
+void rust_vcomp_unmap(struct rust_vcomp_state *s)
+{
+	vcomp_unmap(s);
+}
+
+void rust_vcomp_abort(struct rust_vcomp_state *s)
+{
+	vcomp_abort(s);
+}
+#endif
+
+static void finish_vcomp(struct rust_vcomp_state *s)
+{
+	if (vcomp_classify(s) == VCOMP_DONE)
+		return;
+	vcomp_unmap(s);
+}
+
+static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
+		struct ma_state *mas_detach)
+{
+	struct rust_vcomp_state s = {
+		.vms = vms,
+		.mas_detach = mas_detach,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+
+		rust_vcomp_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_vcomp(&s);
 }
 
 /*
@@ -1912,18 +2048,25 @@ static void reattach_vmas(struct ma_state *mas_detach)
  *
  * Return: 0 on success, error otherwise
  */
-static int vms_gather_munmap_vmas(struct vma_munmap_struct *vms,
-		struct ma_state *mas_detach)
+#define GATHER_DONE		0
+#define GATHER_LOOP		1
+
+struct rust_gather_state {
+	struct vma_munmap_struct *vms;
+	struct ma_state *mas_detach;
+};
+
+static int gather_classify(struct rust_gather_state *s, int *out)
 {
-	struct vm_area_struct *next = NULL;
+	struct vma_munmap_struct *vms = s->vms;
 	int error;
 
+	*out = 0;
 	/*
 	 * If we need to split any vma, do it now to save pain later.
 	 * Does it split the first one?
 	 */
 	if (vms->start > vms->vma->vm_start) {
-
 		/*
 		 * Make sure that map_count on return from munmap() will
 		 * not exceed its limit; but let map_count go just above
@@ -1931,31 +2074,41 @@ static int vms_gather_munmap_vmas(struct vma_munmap_struct *vms,
 		 */
 		if (vms->end < vms->vma->vm_end &&
 		    vms->vma->vm_mm->map_count >= get_sysctl_max_map_count()) {
-			error = -ENOMEM;
-			goto map_count_exceeded;
+			*out = -ENOMEM;
+			return GATHER_DONE;
 		}
 
 		/* Don't bother splitting the VMA if we can't unmap it anyway */
 		if (vma_is_sealed(vms->vma)) {
-			error = -EPERM;
-			goto start_split_failed;
+			*out = -EPERM;
+			return GATHER_DONE;
 		}
 
 		error = __split_vma(vms->vmi, vms->vma, vms->start, 1);
-		if (error)
-			goto start_split_failed;
+		if (error) {
+			*out = error;
+			return GATHER_DONE;
+		}
 	}
 	vms->prev = vma_prev(vms->vmi);
 	if (vms->prev)
 		vms->unmap_start = vms->prev->vm_end;
+	return GATHER_LOOP;
+}
+
+static int gather_loop(struct rust_gather_state *s)
+{
+	struct vma_munmap_struct *vms = s->vms;
+	struct ma_state *mas_detach = s->mas_detach;
+	struct vm_area_struct *next = NULL;
+	int error;
+	long nrpages;
 
 	/*
 	 * Detach a range of VMAs from the mm. Using next as a temp variable as
 	 * it is always overwritten.
 	 */
 	for_each_vma_range(*(vms->vmi), next, vms->end) {
-		long nrpages;
-
 		if (vma_is_sealed(next)) {
 			error = -EPERM;
 			goto modify_vma_failed;
@@ -2045,9 +2198,59 @@ munmap_gather_failed:
 end_split_failed:
 modify_vma_failed:
 	reattach_vmas(mas_detach);
-start_split_failed:
-map_count_exceeded:
 	return error;
+}
+
+static void gather_abort(struct rust_gather_state *s)
+{
+	if (s->vms->vma_count)
+		reattach_vmas(s->mas_detach);
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_gather_classify(struct rust_gather_state *s, int *out)
+{
+	return gather_classify(s, out);
+}
+
+int rust_gather_loop(struct rust_gather_state *s)
+{
+	return gather_loop(s);
+}
+
+void rust_gather_abort(struct rust_gather_state *s)
+{
+	gather_abort(s);
+}
+#endif
+
+static int finish_gather(struct rust_gather_state *s)
+{
+	int out = 0;
+
+	if (gather_classify(s, &out) == GATHER_DONE)
+		return out;
+	return gather_loop(s);
+}
+
+static int vms_gather_munmap_vmas(struct vma_munmap_struct *vms,
+		struct ma_state *mas_detach)
+{
+	struct rust_gather_state s = {
+		.vms = vms,
+		.mas_detach = mas_detach,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_gather_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_gather(&s);
 }
 
 /*
@@ -2097,35 +2300,121 @@ static void init_vma_munmap(struct vma_munmap_struct *vms,
  * Return: 0 on success and drops the lock if so directed, error and leaves the
  * lock held otherwise.
  */
-int do_vmi_align_munmap(struct vma_iterator *vmi, struct vm_area_struct *vma,
-		struct mm_struct *mm, unsigned long start, unsigned long end,
-		struct list_head *uf, bool unlock)
-{
+#define AMUNMAP_DONE		0
+#define AMUNMAP_COMPLETE	1
+
+struct rust_amunmap_state {
+	struct vma_iterator *vmi;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm;
+	unsigned long start;
+	unsigned long end;
+	struct list_head *uf;
+	bool unlock;
 	struct maple_tree mt_detach;
-	MA_STATE(mas_detach, &mt_detach, 0, 0);
-	mt_init_flags(&mt_detach, vmi->mas.tree->ma_flags & MT_FLAGS_LOCK_MASK);
-	mt_on_stack(mt_detach);
+	struct ma_state mas_detach;
 	struct vma_munmap_struct vms;
+	bool gathered;
+};
+
+static int amunmap_classify(struct rust_amunmap_state *s, int *out)
+{
 	int error;
 
-	init_vma_munmap(&vms, vmi, vma, start, end, uf, unlock);
-	error = vms_gather_munmap_vmas(&vms, &mas_detach);
+	*out = 0;
+	s->gathered = false;
+	mt_init_flags(&s->mt_detach,
+		      s->vmi->mas.tree->ma_flags & MT_FLAGS_LOCK_MASK);
+	mt_on_stack(s->mt_detach);
+	mas_init(&s->mas_detach, &s->mt_detach, 0);
+
+	init_vma_munmap(&s->vms, s->vmi, s->vma, s->start, s->end, s->uf,
+			s->unlock);
+	error = vms_gather_munmap_vmas(&s->vms, &s->mas_detach);
 	if (error)
 		goto gather_failed;
 
-	error = vma_iter_clear_gfp(vmi, start, end, GFP_KERNEL);
+	error = vma_iter_clear_gfp(s->vmi, s->start, s->end, GFP_KERNEL);
 	if (error)
 		goto clear_tree_failed;
 
 	/* Point of no return */
-	vms_complete_munmap_vmas(&vms, &mas_detach);
-	return 0;
+	s->gathered = true;
+	return AMUNMAP_COMPLETE;
 
 clear_tree_failed:
-	reattach_vmas(&mas_detach);
+	reattach_vmas(&s->mas_detach);
 gather_failed:
-	validate_mm(mm);
-	return error;
+	validate_mm(s->mm);
+	*out = error;
+	return AMUNMAP_DONE;
+}
+
+static int amunmap_complete(struct rust_amunmap_state *s)
+{
+	vms_complete_munmap_vmas(&s->vms, &s->mas_detach);
+	s->gathered = false;
+	return 0;
+}
+
+static void amunmap_abort(struct rust_amunmap_state *s)
+{
+	if (s->gathered) {
+		vms_complete_munmap_vmas(&s->vms, &s->mas_detach);
+		s->gathered = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_amunmap_classify(struct rust_amunmap_state *s, int *out)
+{
+	return amunmap_classify(s, out);
+}
+
+int rust_amunmap_complete(struct rust_amunmap_state *s)
+{
+	return amunmap_complete(s);
+}
+
+void rust_amunmap_abort(struct rust_amunmap_state *s)
+{
+	amunmap_abort(s);
+}
+#endif
+
+static int finish_amunmap(struct rust_amunmap_state *s)
+{
+	int out = 0;
+
+	if (amunmap_classify(s, &out) == AMUNMAP_DONE)
+		return out;
+	return amunmap_complete(s);
+}
+
+int do_vmi_align_munmap(struct vma_iterator *vmi, struct vm_area_struct *vma,
+		struct mm_struct *mm, unsigned long start, unsigned long end,
+		struct list_head *uf, bool unlock)
+{
+	struct rust_amunmap_state s = {
+		.vmi = vmi,
+		.vma = vma,
+		.mm = mm,
+		.start = start,
+		.end = end,
+		.uf = uf,
+		.unlock = unlock,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_amunmap_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_amunmap(&s);
 }
 
 /*
@@ -4272,42 +4561,116 @@ retry:
  * update accounting. This is shared with both the
  * grow-up and grow-down cases.
  */
-static int acct_stack_growth(struct vm_area_struct *vma,
-			     unsigned long size, unsigned long grow)
+#define ASG_DONE		0
+#define ASG_SEC			1
+
+struct rust_asg_state {
+	struct vm_area_struct *vma;
+	unsigned long size;
+	unsigned long grow;
+};
+
+static int asg_classify(struct rust_asg_state *s, int *out)
 {
+	struct vm_area_struct *vma = s->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long new_start;
 
+	*out = 0;
+
 	/* address space limit tests */
-	if (!may_expand_vm(mm, &vma->flags, grow))
-		return -ENOMEM;
+	if (!may_expand_vm(mm, &vma->flags, s->grow)) {
+		*out = -ENOMEM;
+		return ASG_DONE;
+	}
 
 	/* Stack limit test */
-	if (size > rlimit(RLIMIT_STACK))
-		return -ENOMEM;
+	if (s->size > rlimit(RLIMIT_STACK)) {
+		*out = -ENOMEM;
+		return ASG_DONE;
+	}
 
 	/* mlock limit tests */
 	if (!mlock_future_ok(mm, vma_test(vma, VMA_LOCKED_BIT),
-			     grow << PAGE_SHIFT))
-		return -ENOMEM;
+			     s->grow << PAGE_SHIFT)) {
+		*out = -ENOMEM;
+		return ASG_DONE;
+	}
 
 	/* Check to ensure the stack will not grow into a hugetlb-only region */
-	new_start = vma->vm_end - size;
+	new_start = vma->vm_end - s->size;
 #ifdef CONFIG_STACK_GROWSUP
 	if (vma_test(vma, VMA_GROWSUP_BIT))
 		new_start = vma->vm_start;
 #endif
-	if (is_hugepage_only_range(vma->vm_mm, new_start, size))
-		return -EFAULT;
+	if (is_hugepage_only_range(vma->vm_mm, new_start, s->size)) {
+		*out = -EFAULT;
+		return ASG_DONE;
+	}
+	return ASG_SEC;
+}
 
+static int asg_sec(struct rust_asg_state *s)
+{
 	/*
 	 * Overcommit..  This must be the final test, as it will
 	 * update security statistics.
 	 */
-	if (security_vm_enough_memory_mm(mm, grow))
+	if (security_vm_enough_memory_mm(s->vma->vm_mm, s->grow))
 		return -ENOMEM;
-
 	return 0;
+}
+
+static void asg_abort(struct rust_asg_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_asg_classify(struct rust_asg_state *s, int *out)
+{
+	return asg_classify(s, out);
+}
+
+int rust_asg_sec(struct rust_asg_state *s)
+{
+	return asg_sec(s);
+}
+
+void rust_asg_abort(struct rust_asg_state *s)
+{
+	asg_abort(s);
+}
+#endif
+
+static int finish_asg(struct rust_asg_state *s)
+{
+	int out = 0;
+
+	if (asg_classify(s, &out) == ASG_DONE)
+		return out;
+	return asg_sec(s);
+}
+
+static int acct_stack_growth(struct vm_area_struct *vma,
+			     unsigned long size, unsigned long grow)
+{
+	struct rust_asg_state s = {
+		.vma = vma,
+		.size = size,
+		.grow = grow,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_asg_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_asg(&s);
 }
 
 #ifdef CONFIG_STACK_GROWSUP
@@ -4720,43 +5083,119 @@ __weak unsigned long vma_mmu_pagesize(struct vm_area_struct *vma)
 	return vma_kernel_pagesize(vma);
 }
 
+#define ISM_DONE		0
+#define ISM_LINK		1
+
+struct rust_ism_state {
+	struct mm_struct *mm;
+	unsigned long addr;
+	unsigned long len;
+	vm_flags_t vm_flags;
+	void *priv;
+	const struct vm_operations_struct *ops;
+	struct vm_area_struct *vma;
+};
+
+static int ism_classify(struct rust_ism_state *s, struct vm_area_struct **ret)
+{
+	vma_flags_t vma_flags = legacy_to_vma_flags(s->vm_flags);
+
+	*ret = NULL;
+	s->vma = vm_area_alloc(s->mm);
+	if (unlikely(!s->vma)) {
+		*ret = ERR_PTR(-ENOMEM);
+		return ISM_DONE;
+	}
+
+	vma_flags_set_mask(&vma_flags, s->mm->def_vma_flags);
+	vma_flags_set(&vma_flags, VMA_DONTEXPAND_BIT);
+	if (pgtable_supports_soft_dirty())
+		vma_flags_set(&vma_flags, VMA_SOFTDIRTY_BIT);
+	vma_flags_clear_mask(&vma_flags, VMA_LOCKED_MASK);
+	s->vma->flags = vma_flags;
+	s->vma->vm_page_prot = vma_get_page_prot(s->vma);
+
+	s->vma->vm_ops = s->ops;
+	s->vma->vm_private_data = s->priv;
+	vma_set_range(s->vma, s->addr, s->addr + s->len, 0, s->addr >> PAGE_SHIFT);
+	return ISM_LINK;
+}
+
+static struct vm_area_struct *ism_link(struct rust_ism_state *s)
+{
+	int ret;
+
+	ret = insert_vm_struct(s->mm, s->vma);
+	if (ret)
+		goto out;
+
+	vm_stat_account(s->mm, s->vma->vm_flags, s->len >> PAGE_SHIFT);
+	perf_event_mmap(s->vma);
+	return s->vma;
+
+out:
+	vm_area_free(s->vma);
+	s->vma = NULL;
+	return ERR_PTR(ret);
+}
+
+static void ism_abort(struct rust_ism_state *s)
+{
+	if (s->vma) {
+		vm_area_free(s->vma);
+		s->vma = NULL;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_ism_classify(struct rust_ism_state *s, struct vm_area_struct **ret)
+{
+	return ism_classify(s, ret);
+}
+
+struct vm_area_struct *rust_ism_link(struct rust_ism_state *s)
+{
+	return ism_link(s);
+}
+
+void rust_ism_abort(struct rust_ism_state *s)
+{
+	ism_abort(s);
+}
+#endif
+
+static struct vm_area_struct *finish_ism(struct rust_ism_state *s)
+{
+	struct vm_area_struct *ret = NULL;
+
+	if (ism_classify(s, &ret) == ISM_DONE)
+		return ret;
+	return ism_link(s);
+}
+
 struct vm_area_struct *__install_special_mapping(
 	struct mm_struct *mm,
 	unsigned long addr, unsigned long len,
 	vm_flags_t vm_flags, void *priv,
 	const struct vm_operations_struct *ops)
 {
-	vma_flags_t vma_flags = legacy_to_vma_flags(vm_flags);
-	struct vm_area_struct *vma;
-	int ret;
+	struct rust_ism_state s = {
+		.mm = mm,
+		.addr = addr,
+		.len = len,
+		.vm_flags = vm_flags,
+		.priv = priv,
+		.ops = ops,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		struct vm_area_struct *rust_ret;
 
-	vma = vm_area_alloc(mm);
-	if (unlikely(!vma))
-		return ERR_PTR(-ENOMEM);
-
-	vma_flags_set_mask(&vma_flags, mm->def_vma_flags);
-	vma_flags_set(&vma_flags, VMA_DONTEXPAND_BIT);
-	if (pgtable_supports_soft_dirty())
-		vma_flags_set(&vma_flags, VMA_SOFTDIRTY_BIT);
-	vma_flags_clear_mask(&vma_flags, VMA_LOCKED_MASK);
-	vma->flags = vma_flags;
-	vma->vm_page_prot = vma_get_page_prot(vma);
-
-	vma->vm_ops = ops;
-	vma->vm_private_data = priv;
-	vma_set_range(vma, addr, addr + len, 0, addr >> PAGE_SHIFT);
-
-	ret = insert_vm_struct(mm, vma);
-	if (ret)
-		goto out;
-
-	vm_stat_account(mm, vma->vm_flags, len >> PAGE_SHIFT);
-
-	perf_event_mmap(vma);
-
-	return vma;
-
-out:
-	vm_area_free(vma);
-	return ERR_PTR(ret);
+		rust_ret = rust_ism_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_ism(&s);
 }

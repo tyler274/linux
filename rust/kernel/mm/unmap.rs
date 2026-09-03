@@ -32,7 +32,12 @@
 //! `change_protection` (hugetlb vs page-table range),
 //! `expand_downwards` (prealloc vs grow), `insert_vm_struct`
 //! (account vs maple link), `__split_vma` (dup vs apply),
-//! `vma_link` (prealloc vs store), and `copy_vma` (merge vs dup). The
+//! `vma_link` (prealloc vs store), `copy_vma` (merge vs dup),
+//! `do_vmi_align_munmap` (gather vs complete), `unmap_region`
+//! (tlb gather vs zap/free), `__install_special_mapping`
+//! (alloc vs insert), `vms_gather_munmap_vmas` (start split vs
+//! detach loop), `vms_complete_munmap_vmas` (empty vs unmap),
+//! and `acct_stack_growth` (limits vs security account). The
 //! VMA maple tree is a Rust RCU range array.
 //! File mmap/shmem / page-table walk / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
@@ -165,6 +170,36 @@ const VLINK_STORE: i32 = 1;
 const CVMA_DONE: i32 = 0;
 /// Could not merge; dup and `vma_link`.
 const CVMA_DUP: i32 = 1;
+
+/// Matches `RUST_ISM_*` in `include/linux/mm.h`.
+const ISM_DONE: i32 = 0;
+/// VMA allocated; insert via `insert_vm_struct`.
+const ISM_LINK: i32 = 1;
+
+/// Matches `RUST_AMUNMAP_*` in `include/linux/mm.h`.
+const AMUNMAP_DONE: i32 = 0;
+/// Gathered and maple hole cleared; complete zap.
+const AMUNMAP_COMPLETE: i32 = 1;
+
+/// Matches `RUST_UR_*` in `include/linux/mm.h`.
+const UR_DONE: i32 = 0;
+/// TLB gathered; zap VMAs and free page tables.
+const UR_APPLY: i32 = 1;
+
+/// Matches `RUST_GATHER_*` in `include/linux/mm.h`.
+const GATHER_DONE: i32 = 0;
+/// Start split done (or not needed); detach remaining VMAs.
+const GATHER_LOOP: i32 = 1;
+
+/// Matches `RUST_VCOMP_*` in `include/linux/mm.h`.
+const VCOMP_DONE: i32 = 0;
+/// Stats updated; zap, free, and destroy the detach tree.
+const VCOMP_UNMAP: i32 = 1;
+
+/// Matches `RUST_ASG_*` in `include/linux/mm.h`.
+const ASG_DONE: i32 = 0;
+/// Limits passed; `security_vm_enough_memory_mm`.
+const ASG_SEC: i32 = 1;
 
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
@@ -327,6 +362,12 @@ static N_IVS: Atomic<u32> = Atomic::new(0);
 static N_SVMA: Atomic<u32> = Atomic::new(0);
 static N_VLINK: Atomic<u32> = Atomic::new(0);
 static N_CVMA: Atomic<u32> = Atomic::new(0);
+static N_ISM: Atomic<u32> = Atomic::new(0);
+static N_AMUNMAP: Atomic<u32> = Atomic::new(0);
+static N_UR: Atomic<u32> = Atomic::new(0);
+static N_GATHER: Atomic<u32> = Atomic::new(0);
+static N_VCOMP: Atomic<u32> = Atomic::new(0);
+static N_ASG: Atomic<u32> = Atomic::new(0);
 static N_VEX: Atomic<u32> = Atomic::new(0);
 static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
@@ -535,7 +576,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages/change_protection/expand_downwards/insert_vm_struct/split_vma/vma_link/copy_vma sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages/change_protection/expand_downwards/insert_vm_struct/split_vma/vma_link/copy_vma/do_vmi_align_munmap/unmap_region/install_special_mapping/vms_gather/vms_complete/acct_stack_growth sequencer\n");
     crate::mm::mtree::announce_once();
 }
 
@@ -2634,6 +2675,270 @@ pub unsafe extern "C" fn rust_cvma_dispatch(
         _ => {
             pr_err!("rust-mmap: unknown copy_vma kind {kind}\n");
             ptr::null_mut()
+        }
+    }
+}
+
+/// C ABI: sequence `__install_special_mapping` after C allocates the VMA.
+///
+/// Sets `*handled` once classify has run. `insert_vm_struct` stays in C.
+/// Unknown kind frees a leftover VMA.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_ism_state` with `mm`/`addr`/`len`/`vm_flags`/
+/// `priv`/`ops` filled. mmap write lock held. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_ism_dispatch(
+    s: *mut bindings::rust_ism_state,
+    handled: *mut c_int,
+) -> *mut bindings::vm_area_struct {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_ptr();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut ret = ptr::null_mut();
+    // SAFETY: `s` is live; classify may allocate a VMA.
+    let kind = unsafe { bindings::rust_ism_classify(s, &mut ret) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_ISM.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first __install_special_mapping sequenced\n");
+    }
+
+    match kind {
+        ISM_DONE => ret,
+        // SAFETY: VMA allocated; insert in C.
+        ISM_LINK => unsafe { bindings::rust_ism_link(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown __install_special_mapping kind {kind}\n");
+            // SAFETY: Free a leftover VMA.
+            unsafe { bindings::rust_ism_abort(s) };
+            EINVAL.to_ptr()
+        }
+    }
+}
+
+/// C ABI: sequence `do_vmi_align_munmap` after C gathers VMAs.
+///
+/// Sets `*handled` once classify has run. Zap/free stays in C. Unknown
+/// kind completes a gathered munmap so detached VMAs are not leaked.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_amunmap_state` with `vmi`/`vma`/`mm`/`start`/
+/// `end`/`uf`/`unlock` filled. mmap write lock held. `handled` must be a
+/// valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_amunmap_dispatch(
+    s: *mut bindings::rust_amunmap_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may split and detach VMAs.
+    let kind = unsafe { bindings::rust_amunmap_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_AMUNMAP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first do_vmi_align_munmap sequenced\n");
+    }
+
+    match kind {
+        AMUNMAP_DONE => out,
+        // SAFETY: Gathered and hole cleared; complete zap in C.
+        AMUNMAP_COMPLETE => unsafe { bindings::rust_amunmap_complete(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown do_vmi_align_munmap kind {kind}\n");
+            // SAFETY: Complete a gathered munmap.
+            unsafe { bindings::rust_amunmap_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `unmap_region` after C gathers the TLB.
+///
+/// Sets `*handled` once classify has run. Zap and page-table free stay
+/// in C. Unknown kind finishes a leftover TLB gather.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_ur_state` with `unmap` filled. mmap write
+/// lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_ur_dispatch(
+    s: *mut bindings::rust_ur_state,
+    handled: *mut c_int,
+) {
+    if s.is_null() || handled.is_null() {
+        return;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: `s` is live; classify gathers the TLB.
+    let kind = unsafe { bindings::rust_ur_classify(s) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_UR.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first unmap_region sequenced\n");
+    }
+
+    match kind {
+        UR_DONE => {}
+        // SAFETY: TLB gathered; zap and free page tables in C.
+        UR_APPLY => unsafe { bindings::rust_ur_apply(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown unmap_region kind {kind}\n");
+            // SAFETY: Finish a leftover TLB gather.
+            unsafe { bindings::rust_ur_abort(s) };
+        }
+    }
+}
+
+/// C ABI: sequence `vms_gather_munmap_vmas` after C splits the start.
+///
+/// Sets `*handled` once classify has run. Detach loop stays in C.
+/// Unknown kind reattaches any detached VMAs.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_gather_state` with `vms`/`mas_detach`
+/// filled. mmap write lock held. `handled` must be a valid
+/// out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_gather_dispatch(
+    s: *mut bindings::rust_gather_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may split the first VMA.
+    let kind = unsafe { bindings::rust_gather_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_GATHER.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vms_gather_munmap_vmas sequenced\n");
+    }
+
+    match kind {
+        GATHER_DONE => out,
+        // SAFETY: Start split done; detach remaining VMAs in C.
+        GATHER_LOOP => unsafe { bindings::rust_gather_loop(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vms_gather_munmap_vmas kind {kind}\n");
+            // SAFETY: Reattach any detached VMAs.
+            unsafe { bindings::rust_gather_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `vms_complete_munmap_vmas` after C updates counts.
+///
+/// Sets `*handled` once classify has run. Zap/free stay in C. Unknown
+/// kind completes a leftover unmap so detached VMAs are not leaked.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vcomp_state` with `vms`/`mas_detach`
+/// filled. mmap write lock held unless already downgraded. `handled`
+/// must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vcomp_dispatch(
+    s: *mut bindings::rust_vcomp_state,
+    handled: *mut c_int,
+) {
+    if s.is_null() || handled.is_null() {
+        return;
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    // SAFETY: `s` is live; classify may downgrade the mmap lock.
+    let kind = unsafe { bindings::rust_vcomp_classify(s) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VCOMP.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vms_complete_munmap_vmas sequenced\n");
+    }
+
+    match kind {
+        VCOMP_DONE => {}
+        // SAFETY: Counts updated; zap and free in C.
+        VCOMP_UNMAP => unsafe { bindings::rust_vcomp_unmap(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vms_complete_munmap_vmas kind {kind}\n");
+            // SAFETY: Complete a leftover unmap.
+            unsafe { bindings::rust_vcomp_abort(s) };
+        }
+    }
+}
+
+/// C ABI: sequence `acct_stack_growth` after C checks VMA limits.
+///
+/// Sets `*handled` once classify has run. Overcommit accounting stays
+/// in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_asg_state` with `vma`/`size`/`grow` filled.
+/// mmap write lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_asg_dispatch(
+    s: *mut bindings::rust_asg_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify checks stack growth limits.
+    let kind = unsafe { bindings::rust_asg_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_ASG.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first acct_stack_growth sequenced\n");
+    }
+
+    match kind {
+        ASG_DONE => out,
+        // SAFETY: Limits passed; overcommit account in C.
+        ASG_SEC => unsafe { bindings::rust_asg_sec(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown acct_stack_growth kind {kind}\n");
+            // SAFETY: Nothing to roll back.
+            unsafe { bindings::rust_asg_abort(s) };
+            EINVAL.to_errno()
         }
     }
 }

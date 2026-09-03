@@ -4325,6 +4325,20 @@ int rust_munmap_classify(struct vma_iterator *vmi, struct mm_struct *mm,
 int rust_munmap_align(struct vma_iterator *vmi, struct vm_area_struct *vma,
 		      struct mm_struct *mm, unsigned long start,
 		      unsigned long end, struct list_head *uf, bool unlock);
+struct rust_amunmap_state;
+#define RUST_AMUNMAP_DONE	0
+#define RUST_AMUNMAP_COMPLETE	1
+int rust_amunmap_dispatch(struct rust_amunmap_state *s, int *handled);
+int rust_amunmap_classify(struct rust_amunmap_state *s, int *out);
+int rust_amunmap_complete(struct rust_amunmap_state *s);
+void rust_amunmap_abort(struct rust_amunmap_state *s);
+struct rust_ur_state;
+#define RUST_UR_DONE		0
+#define RUST_UR_APPLY		1
+void rust_ur_dispatch(struct rust_ur_state *s, int *handled);
+int rust_ur_classify(struct rust_ur_state *s);
+void rust_ur_apply(struct rust_ur_state *s);
+void rust_ur_abort(struct rust_ur_state *s);
 #define RUST_DOMMAP_DONE	0
 #define RUST_DOMMAP_REGION	1
 unsigned long rust_dommap_dispatch(struct file *file, unsigned long *addr,
@@ -4425,6 +4439,36 @@ struct vm_area_struct *rust_cvma_dispatch(struct rust_cvma_state *s,
 int rust_cvma_classify(struct rust_cvma_state *s,
 		       struct vm_area_struct **ret);
 struct vm_area_struct *rust_cvma_dup(struct rust_cvma_state *s);
+struct rust_ism_state;
+#define RUST_ISM_DONE		0
+#define RUST_ISM_LINK		1
+struct vm_area_struct *rust_ism_dispatch(struct rust_ism_state *s,
+					 int *handled);
+int rust_ism_classify(struct rust_ism_state *s,
+		      struct vm_area_struct **ret);
+struct vm_area_struct *rust_ism_link(struct rust_ism_state *s);
+void rust_ism_abort(struct rust_ism_state *s);
+struct rust_gather_state;
+#define RUST_GATHER_DONE	0
+#define RUST_GATHER_LOOP	1
+int rust_gather_dispatch(struct rust_gather_state *s, int *handled);
+int rust_gather_classify(struct rust_gather_state *s, int *out);
+int rust_gather_loop(struct rust_gather_state *s);
+void rust_gather_abort(struct rust_gather_state *s);
+struct rust_vcomp_state;
+#define RUST_VCOMP_DONE		0
+#define RUST_VCOMP_UNMAP	1
+void rust_vcomp_dispatch(struct rust_vcomp_state *s, int *handled);
+int rust_vcomp_classify(struct rust_vcomp_state *s);
+void rust_vcomp_unmap(struct rust_vcomp_state *s);
+void rust_vcomp_abort(struct rust_vcomp_state *s);
+struct rust_asg_state;
+#define RUST_ASG_DONE		0
+#define RUST_ASG_SEC		1
+int rust_asg_dispatch(struct rust_asg_state *s, int *handled);
+int rust_asg_classify(struct rust_asg_state *s, int *out);
+int rust_asg_sec(struct rust_asg_state *s);
+void rust_asg_abort(struct rust_asg_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;
