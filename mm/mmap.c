@@ -1228,6 +1228,72 @@ struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 }
 EXPORT_SYMBOL(find_vma);
 
+#define FVP_HIT			0
+#define FVP_NEXT		1
+
+struct rust_fvp_state {
+	struct mm_struct *mm;
+	unsigned long addr;
+	struct vm_area_struct **pprev;
+	struct vma_iterator vmi;
+	struct vm_area_struct *vma;
+};
+
+static int fvp_classify(struct rust_fvp_state *s)
+{
+	mmap_assert_locked(s->mm);
+	vma_iter_init(&s->vmi, s->mm, s->addr);
+	s->vma = vma_iter_load(&s->vmi);
+	*s->pprev = vma_prev(&s->vmi);
+	if (s->vma)
+		return FVP_HIT;
+	return FVP_NEXT;
+}
+
+static struct vm_area_struct *fvp_hit(struct rust_fvp_state *s)
+{
+	return s->vma;
+}
+
+static struct vm_area_struct *fvp_next(struct rust_fvp_state *s)
+{
+	return vma_next(&s->vmi);
+}
+
+static void fvp_abort(struct rust_fvp_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_fvp_classify(struct rust_fvp_state *s)
+{
+	return fvp_classify(s);
+}
+
+struct vm_area_struct *rust_fvp_hit(struct rust_fvp_state *s)
+{
+	return fvp_hit(s);
+}
+
+struct vm_area_struct *rust_fvp_next(struct rust_fvp_state *s)
+{
+	return fvp_next(s);
+}
+
+void rust_fvp_abort(struct rust_fvp_state *s)
+{
+	fvp_abort(s);
+}
+#endif
+
+static struct vm_area_struct *finish_fvp(struct rust_fvp_state *s)
+{
+	if (fvp_classify(s) == FVP_HIT)
+		return fvp_hit(s);
+	return fvp_next(s);
+}
+
 /**
  * find_vma_prev() - Find the VMA for a given address, or the next vma and
  * set %pprev to the previous VMA, if any.
@@ -1245,14 +1311,22 @@ struct vm_area_struct *
 find_vma_prev(struct mm_struct *mm, unsigned long addr,
 			struct vm_area_struct **pprev)
 {
-	struct vm_area_struct *vma;
-	VMA_ITERATOR(vmi, mm, addr);
+	struct rust_fvp_state s = {
+		.mm = mm,
+		.addr = addr,
+		.pprev = pprev,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		struct vm_area_struct *rust_ret;
 
-	vma = vma_iter_load(&vmi);
-	*pprev = vma_prev(&vmi);
-	if (!vma)
-		vma = vma_next(&vmi);
-	return vma;
+		rust_ret = rust_fvp_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_fvp(&s);
 }
 
 /* enforced gap between the expanding stack and other mappings. */
@@ -1440,8 +1514,58 @@ struct vm_area_struct *expand_stack(struct mm_struct *mm, unsigned long addr)
 	return finish_estk(&s);
 }
 
-/* do_munmap() - Wrapper function for non-maple tree aware do_munmap() calls.
- * @mm: The mm_struct
+#define DMUNMAP_APPLY		0
+
+struct rust_dmunmap_state {
+	struct mm_struct *mm;
+	unsigned long start;
+	size_t len;
+	struct list_head *uf;
+	struct vma_iterator vmi;
+};
+
+static int dmunmap_classify(struct rust_dmunmap_state *s)
+{
+	vma_iter_init(&s->vmi, s->mm, s->start);
+	return DMUNMAP_APPLY;
+}
+
+static int dmunmap_apply(struct rust_dmunmap_state *s)
+{
+	return do_vmi_munmap(&s->vmi, s->mm, s->start, s->len, s->uf, false);
+}
+
+static void dmunmap_abort(struct rust_dmunmap_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_dmunmap_classify(struct rust_dmunmap_state *s)
+{
+	return dmunmap_classify(s);
+}
+
+int rust_dmunmap_apply(struct rust_dmunmap_state *s)
+{
+	return dmunmap_apply(s);
+}
+
+void rust_dmunmap_abort(struct rust_dmunmap_state *s)
+{
+	dmunmap_abort(s);
+}
+#endif
+
+static int finish_dmunmap(struct rust_dmunmap_state *s)
+{
+	dmunmap_classify(s);
+	return dmunmap_apply(s);
+}
+
+/**
+ * do_munmap() - Wrapper around do_vmi_munmap() with a VMA iterator.
+ * @mm: The mm_struct to check
  * @start: The start address to munmap
  * @len: The length to be munmapped.
  * @uf: The userfaultfd list_head
@@ -1451,9 +1575,23 @@ struct vm_area_struct *expand_stack(struct mm_struct *mm, unsigned long addr)
 int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 	      struct list_head *uf)
 {
-	VMA_ITERATOR(vmi, mm, start);
+	struct rust_dmunmap_state s = {
+		.mm = mm,
+		.start = start,
+		.len = len,
+		.uf = uf,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
 
-	return do_vmi_munmap(&vmi, mm, start, len, uf, false);
+		rust_ret = rust_dmunmap_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_dmunmap(&s);
 }
 
 int vm_munmap(unsigned long start, size_t len)

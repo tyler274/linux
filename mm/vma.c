@@ -504,17 +504,89 @@ static bool can_vma_merge_right(struct vma_merge_struct *vmg,
 		prev->anon_vma == next->anon_vma;
 }
 
+#define RVMA_ANON		0
+#define RVMA_FILE		1
+
+struct rust_rvma_state {
+	struct vm_area_struct *vma;
+};
+
+static int rvma_classify(struct rust_rvma_state *s)
+{
+	might_sleep();
+	if (s->vma->vm_file)
+		return RVMA_FILE;
+	return RVMA_ANON;
+}
+
+static void rvma_anon(struct rust_rvma_state *s)
+{
+	vma_close(s->vma);
+	mpol_put(vma_policy(s->vma));
+	vm_area_free(s->vma);
+}
+
+static void rvma_file(struct rust_rvma_state *s)
+{
+	vma_close(s->vma);
+	fput(s->vma->vm_file);
+	mpol_put(vma_policy(s->vma));
+	vm_area_free(s->vma);
+}
+
+static void rvma_abort(struct rust_rvma_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_rvma_classify(struct rust_rvma_state *s)
+{
+	return rvma_classify(s);
+}
+
+void rust_rvma_anon(struct rust_rvma_state *s)
+{
+	rvma_anon(s);
+}
+
+void rust_rvma_file(struct rust_rvma_state *s)
+{
+	rvma_file(s);
+}
+
+void rust_rvma_abort(struct rust_rvma_state *s)
+{
+	rvma_abort(s);
+}
+#endif
+
+static void finish_rvma(struct rust_rvma_state *s)
+{
+	if (rvma_classify(s) == RVMA_FILE)
+		rvma_file(s);
+	else
+		rvma_anon(s);
+}
+
 /*
  * Close a vm structure and free it.
  */
 void remove_vma(struct vm_area_struct *vma)
 {
-	might_sleep();
-	vma_close(vma);
-	if (vma->vm_file)
-		fput(vma->vm_file);
-	mpol_put(vma_policy(vma));
-	vm_area_free(vma);
+	struct rust_rvma_state s = {
+		.vma = vma,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+
+		rust_rvma_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_rvma(&s);
 }
 
 /*
@@ -2876,6 +2948,59 @@ struct vm_area_struct *vma_modify_flags_uffd(struct vma_iterator *vmi,
 	return vma_modify(&vmg);
 }
 
+#define VME_APPLY		0
+
+struct rust_vme_state {
+	struct vma_iterator *vmi;
+	struct vm_area_struct *vma;
+	unsigned long delta;
+	struct vma_merge_struct vmg;
+};
+
+static int vme_classify(struct rust_vme_state *s)
+{
+	VMG_VMA_STATE(vmg, s->vmi, s->vma, s->vma, s->vma->vm_end,
+		      s->vma->vm_end + s->delta);
+
+	s->vmg = vmg;
+	s->vmg.next = vma_iter_next_rewind(s->vmi, NULL);
+	s->vmg.middle = NULL; /* We use the VMA to populate VMG fields only. */
+	return VME_APPLY;
+}
+
+static struct vm_area_struct *vme_apply(struct rust_vme_state *s)
+{
+	return vma_merge_new_range(&s->vmg);
+}
+
+static void vme_abort(struct rust_vme_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vme_classify(struct rust_vme_state *s)
+{
+	return vme_classify(s);
+}
+
+struct vm_area_struct *rust_vme_apply(struct rust_vme_state *s)
+{
+	return vme_apply(s);
+}
+
+void rust_vme_abort(struct rust_vme_state *s)
+{
+	vme_abort(s);
+}
+#endif
+
+static struct vm_area_struct *finish_vme(struct rust_vme_state *s)
+{
+	vme_classify(s);
+	return vme_apply(s);
+}
+
 /*
  * Expand vma by delta bytes, potentially merging with an immediately adjacent
  * VMA with identical properties.
@@ -2884,12 +3009,22 @@ struct vm_area_struct *vma_merge_extend(struct vma_iterator *vmi,
 					struct vm_area_struct *vma,
 					unsigned long delta)
 {
-	VMG_VMA_STATE(vmg, vmi, vma, vma, vma->vm_end, vma->vm_end + delta);
+	struct rust_vme_state s = {
+		.vmi = vmi,
+		.vma = vma,
+		.delta = delta,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		struct vm_area_struct *rust_ret;
 
-	vmg.next = vma_iter_next_rewind(vmi, NULL);
-	vmg.middle = NULL; /* We use the VMA to populate VMG fields only. */
-
-	return vma_merge_new_range(&vmg);
+		rust_ret = rust_vme_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_vme(&s);
 }
 
 void unlink_file_vma_batch_init(struct unlink_vma_file_batch *vb)

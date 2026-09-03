@@ -22,7 +22,7 @@ pub mod virt;
 use virt::VmaRef;
 
 #[cfg(CONFIG_RUST_MMAP)]
-pub mod unmap;
+pub mod mmap;
 
 #[cfg(CONFIG_RUST_MMAP)]
 pub mod mtree;

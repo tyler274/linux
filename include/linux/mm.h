@@ -4560,6 +4560,36 @@ int rust_emmap_classify(struct rust_emmap_state *s);
 void rust_emmap_empty(struct rust_emmap_state *s);
 void rust_emmap_unmap(struct rust_emmap_state *s);
 void rust_emmap_abort(struct rust_emmap_state *s);
+struct rust_fvp_state;
+#define RUST_FVP_HIT		0
+#define RUST_FVP_NEXT		1
+struct vm_area_struct *rust_fvp_dispatch(struct rust_fvp_state *s,
+					 int *handled);
+int rust_fvp_classify(struct rust_fvp_state *s);
+struct vm_area_struct *rust_fvp_hit(struct rust_fvp_state *s);
+struct vm_area_struct *rust_fvp_next(struct rust_fvp_state *s);
+void rust_fvp_abort(struct rust_fvp_state *s);
+struct rust_dmunmap_state;
+#define RUST_DMUNMAP_APPLY	0
+int rust_dmunmap_dispatch(struct rust_dmunmap_state *s, int *handled);
+int rust_dmunmap_classify(struct rust_dmunmap_state *s);
+int rust_dmunmap_apply(struct rust_dmunmap_state *s);
+void rust_dmunmap_abort(struct rust_dmunmap_state *s);
+struct rust_rvma_state;
+#define RUST_RVMA_ANON		0
+#define RUST_RVMA_FILE		1
+void rust_rvma_dispatch(struct rust_rvma_state *s, int *handled);
+int rust_rvma_classify(struct rust_rvma_state *s);
+void rust_rvma_anon(struct rust_rvma_state *s);
+void rust_rvma_file(struct rust_rvma_state *s);
+void rust_rvma_abort(struct rust_rvma_state *s);
+struct rust_vme_state;
+#define RUST_VME_APPLY		0
+struct vm_area_struct *rust_vme_dispatch(struct rust_vme_state *s,
+					 int *handled);
+int rust_vme_classify(struct rust_vme_state *s);
+struct vm_area_struct *rust_vme_apply(struct rust_vme_state *s);
+void rust_vme_abort(struct rust_vme_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;

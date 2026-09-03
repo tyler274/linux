@@ -251,7 +251,9 @@ config RUST_MMAP
 	  vma_link_file (no file vs i_mmap link), __vm_munmap
 	  (lock vs unmap), ksys_mmap_pgoff (file vs anon mmap),
 	  split_vma (map_count vs split), unlink_file_vma_batch_add
-	  (skip vs flush vs add), and exit_mmap (empty vs unmap).
+	  (skip vs flush vs add), exit_mmap (empty vs unmap),
+	  find_vma_prev (hit vs next), do_munmap (iter vs unmap),
+	  remove_vma (anon vs file), and vma_merge_extend (setup vs merge).
 	  The VMA maple tree is a Rust RCU range array; irq and
 	  other maple trees stay in C.
 	  File mmap/shmem and page-table walk bodies stay in C.

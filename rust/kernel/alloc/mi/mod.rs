@@ -110,7 +110,7 @@ pub unsafe extern "C" fn rust_mi_init() {
     #[cfg(CONFIG_RUST_VMALLOC)]
     crate::alloc::vmalloc::announce();
     #[cfg(CONFIG_RUST_MMAP)]
-    crate::mm::unmap::announce();
+    crate::mm::mmap::announce();
     #[cfg(CONFIG_RUST_FAULT)]
     crate::mm::fault::announce();
 }
