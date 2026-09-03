@@ -788,13 +788,82 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
  * Split a vma into two pieces at address 'addr', a new vma is allocated
  * either for the first part or the tail.
  */
+#define SPW_DONE		0
+#define SPW_APPLY		1
+
+struct rust_spw_state {
+	struct vma_iterator *vmi;
+	struct vm_area_struct *vma;
+	unsigned long addr;
+	int new_below;
+};
+
+static int spw_classify(struct rust_spw_state *s, int *out)
+{
+	*out = 0;
+	if (s->vma->vm_mm->map_count >= get_sysctl_max_map_count()) {
+		*out = -ENOMEM;
+		return SPW_DONE;
+	}
+	return SPW_APPLY;
+}
+
+static int spw_apply(struct rust_spw_state *s)
+{
+	return __split_vma(s->vmi, s->vma, s->addr, s->new_below);
+}
+
+static void spw_abort(struct rust_spw_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_spw_classify(struct rust_spw_state *s, int *out)
+{
+	return spw_classify(s, out);
+}
+
+int rust_spw_apply(struct rust_spw_state *s)
+{
+	return spw_apply(s);
+}
+
+void rust_spw_abort(struct rust_spw_state *s)
+{
+	spw_abort(s);
+}
+#endif
+
+static int finish_spw(struct rust_spw_state *s)
+{
+	int out = 0;
+
+	if (spw_classify(s, &out) == SPW_DONE)
+		return out;
+	return spw_apply(s);
+}
+
 static int split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 		     unsigned long addr, int new_below)
 {
-	if (vma->vm_mm->map_count >= get_sysctl_max_map_count())
-		return -ENOMEM;
+	struct rust_spw_state s = {
+		.vmi = vmi,
+		.vma = vma,
+		.addr = addr,
+		.new_below = new_below,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
 
-	return __split_vma(vmi, vma, addr, new_below);
+		rust_ret = rust_spw_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_spw(&s);
 }
 
 /*
@@ -2844,18 +2913,91 @@ static void unlink_file_vma_batch_process(struct unlink_vma_file_batch *vb)
 	unlink_file_vma_batch_init(vb);
 }
 
+#define UBADD_DONE		0
+#define UBADD_PROCESS		1
+#define UBADD_ADD		2
+
+struct rust_ubadd_state {
+	struct unlink_vma_file_batch *vb;
+	struct vm_area_struct *vma;
+};
+
+static int ubadd_classify(struct rust_ubadd_state *s)
+{
+	if (s->vma->vm_file == NULL)
+		return UBADD_DONE;
+	if ((s->vb->count > 0 && s->vb->vmas[0]->vm_file != s->vma->vm_file) ||
+	    s->vb->count == ARRAY_SIZE(s->vb->vmas))
+		return UBADD_PROCESS;
+	return UBADD_ADD;
+}
+
+static void ubadd_process(struct rust_ubadd_state *s)
+{
+	unlink_file_vma_batch_process(s->vb);
+}
+
+static void ubadd_add(struct rust_ubadd_state *s)
+{
+	s->vb->vmas[s->vb->count] = s->vma;
+	s->vb->count++;
+}
+
+static void ubadd_abort(struct rust_ubadd_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_ubadd_classify(struct rust_ubadd_state *s)
+{
+	return ubadd_classify(s);
+}
+
+void rust_ubadd_process(struct rust_ubadd_state *s)
+{
+	ubadd_process(s);
+}
+
+void rust_ubadd_add(struct rust_ubadd_state *s)
+{
+	ubadd_add(s);
+}
+
+void rust_ubadd_abort(struct rust_ubadd_state *s)
+{
+	ubadd_abort(s);
+}
+#endif
+
+static void finish_ubadd(struct rust_ubadd_state *s)
+{
+	int kind = ubadd_classify(s);
+
+	if (kind == UBADD_DONE)
+		return;
+	if (kind == UBADD_PROCESS)
+		ubadd_process(s);
+	ubadd_add(s);
+}
+
 void unlink_file_vma_batch_add(struct unlink_vma_file_batch *vb,
 			       struct vm_area_struct *vma)
 {
-	if (vma->vm_file == NULL)
-		return;
+	struct rust_ubadd_state s = {
+		.vb = vb,
+		.vma = vma,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
 
-	if ((vb->count > 0 && vb->vmas[0]->vm_file != vma->vm_file) ||
-	    vb->count == ARRAY_SIZE(vb->vmas))
-		unlink_file_vma_batch_process(vb);
-
-	vb->vmas[vb->count] = vma;
-	vb->count++;
+		rust_ubadd_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_ubadd(&s);
 }
 
 void unlink_file_vma_batch_final(struct unlink_vma_file_batch *vb)

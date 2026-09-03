@@ -4529,6 +4529,37 @@ int rust_vmunmap_dispatch(struct rust_vmunmap_state *s, int *handled);
 int rust_vmunmap_classify(struct rust_vmunmap_state *s, int *out);
 int rust_vmunmap_apply(struct rust_vmunmap_state *s);
 void rust_vmunmap_abort(struct rust_vmunmap_state *s);
+struct rust_kmp_state;
+#define RUST_KMP_DONE		0
+#define RUST_KMP_MMAP		1
+unsigned long rust_kmp_dispatch(struct rust_kmp_state *s, int *handled);
+int rust_kmp_classify(struct rust_kmp_state *s, unsigned long *out);
+unsigned long rust_kmp_mmap(struct rust_kmp_state *s);
+void rust_kmp_abort(struct rust_kmp_state *s);
+struct rust_spw_state;
+#define RUST_SPW_DONE		0
+#define RUST_SPW_APPLY		1
+int rust_spw_dispatch(struct rust_spw_state *s, int *handled);
+int rust_spw_classify(struct rust_spw_state *s, int *out);
+int rust_spw_apply(struct rust_spw_state *s);
+void rust_spw_abort(struct rust_spw_state *s);
+struct rust_ubadd_state;
+#define RUST_UBADD_DONE		0
+#define RUST_UBADD_PROCESS	1
+#define RUST_UBADD_ADD		2
+void rust_ubadd_dispatch(struct rust_ubadd_state *s, int *handled);
+int rust_ubadd_classify(struct rust_ubadd_state *s);
+void rust_ubadd_process(struct rust_ubadd_state *s);
+void rust_ubadd_add(struct rust_ubadd_state *s);
+void rust_ubadd_abort(struct rust_ubadd_state *s);
+struct rust_emmap_state;
+#define RUST_EMMAP_EMPTY	0
+#define RUST_EMMAP_UNMAP	1
+void rust_emmap_dispatch(struct rust_emmap_state *s, int *handled);
+int rust_emmap_classify(struct rust_emmap_state *s);
+void rust_emmap_empty(struct rust_emmap_state *s);
+void rust_emmap_unmap(struct rust_emmap_state *s);
+void rust_emmap_abort(struct rust_emmap_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;

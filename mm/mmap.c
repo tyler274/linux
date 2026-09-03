@@ -787,49 +787,140 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			   populate, uf);
 }
 
-unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
-			      unsigned long prot, unsigned long flags,
-			      unsigned long fd, unsigned long pgoff)
-{
-	struct file *file = NULL;
-	unsigned long retval;
+#define KMP_DONE		0
+#define KMP_MMAP		1
 
-	if (!(flags & MAP_ANONYMOUS)) {
-		audit_mmap_fd(fd, flags);
-		file = fget(fd);
-		if (!file)
-			return -EBADF;
-		if (is_file_hugepages(file)) {
-			len = ALIGN(len, huge_page_size(hstate_file(file)));
-		} else if (unlikely(flags & MAP_HUGETLB)) {
-			retval = -EINVAL;
-			goto out_fput;
+struct rust_kmp_state {
+	unsigned long addr;
+	unsigned long len;
+	unsigned long prot;
+	unsigned long flags;
+	unsigned long fd;
+	unsigned long pgoff;
+	struct file *file;
+};
+
+static int kmp_classify(struct rust_kmp_state *s, unsigned long *out)
+{
+	*out = 0;
+	s->file = NULL;
+
+	if (!(s->flags & MAP_ANONYMOUS)) {
+		audit_mmap_fd(s->fd, s->flags);
+		s->file = fget(s->fd);
+		if (!s->file) {
+			*out = -EBADF;
+			return KMP_DONE;
 		}
-	} else if (flags & MAP_HUGETLB) {
+		if (is_file_hugepages(s->file)) {
+			s->len = ALIGN(s->len,
+				       huge_page_size(hstate_file(s->file)));
+		} else if (unlikely(s->flags & MAP_HUGETLB)) {
+			*out = -EINVAL;
+			fput(s->file);
+			s->file = NULL;
+			return KMP_DONE;
+		}
+		return KMP_MMAP;
+	}
+
+	if (s->flags & MAP_HUGETLB) {
 		struct hstate *hs;
 
-		hs = hstate_sizelog((flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
-		if (!hs)
-			return -EINVAL;
+		hs = hstate_sizelog((s->flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
+		if (!hs) {
+			*out = -EINVAL;
+			return KMP_DONE;
+		}
 
-		len = ALIGN(len, huge_page_size(hs));
+		s->len = ALIGN(s->len, huge_page_size(hs));
 		/*
 		 * VM_NORESERVE is used because the reservations will be
 		 * taken when vm_ops->mmap() is called
 		 */
-		file = hugetlb_file_setup(HUGETLB_ANON_FILE, len,
+		s->file = hugetlb_file_setup(HUGETLB_ANON_FILE, s->len,
 				mk_vma_flags(VMA_NORESERVE_BIT),
 				HUGETLB_ANONHUGE_INODE,
-				(flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
-		if (IS_ERR(file))
-			return PTR_ERR(file);
+				(s->flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
+		if (IS_ERR(s->file)) {
+			*out = PTR_ERR(s->file);
+			s->file = NULL;
+			return KMP_DONE;
+		}
 	}
+	return KMP_MMAP;
+}
 
-	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
-out_fput:
-	if (file)
-		fput(file);
+static unsigned long kmp_mmap(struct rust_kmp_state *s)
+{
+	unsigned long retval;
+
+	retval = vm_mmap_pgoff(s->file, s->addr, s->len, s->prot, s->flags,
+			       s->pgoff);
+	if (s->file) {
+		fput(s->file);
+		s->file = NULL;
+	}
 	return retval;
+}
+
+static void kmp_abort(struct rust_kmp_state *s)
+{
+	if (s->file) {
+		fput(s->file);
+		s->file = NULL;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_kmp_classify(struct rust_kmp_state *s, unsigned long *out)
+{
+	return kmp_classify(s, out);
+}
+
+unsigned long rust_kmp_mmap(struct rust_kmp_state *s)
+{
+	return kmp_mmap(s);
+}
+
+void rust_kmp_abort(struct rust_kmp_state *s)
+{
+	kmp_abort(s);
+}
+#endif
+
+static unsigned long finish_kmp(struct rust_kmp_state *s)
+{
+	unsigned long out = 0;
+
+	if (kmp_classify(s, &out) == KMP_DONE)
+		return out;
+	return kmp_mmap(s);
+}
+
+unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
+			      unsigned long prot, unsigned long flags,
+			      unsigned long fd, unsigned long pgoff)
+{
+	struct rust_kmp_state s = {
+		.addr = addr,
+		.len = len,
+		.prot = prot,
+		.flags = flags,
+		.fd = fd,
+		.pgoff = pgoff,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		unsigned long rust_ret;
+
+		rust_ret = rust_kmp_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_kmp(&s);
 }
 
 SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
@@ -1765,61 +1856,163 @@ unsigned long tear_down_vmas(struct mm_struct *mm, struct vma_iterator *vmi,
 	return nr_accounted;
 }
 
-/* Release all mmaps. */
-void exit_mmap(struct mm_struct *mm)
-{
+#define EMMAP_EMPTY		0
+#define EMMAP_UNMAP		1
+
+struct rust_emmap_state {
+	struct mm_struct *mm;
 	struct mmu_gather tlb;
 	struct vm_area_struct *vma;
-	unsigned long nr_accounted = 0;
-	VMA_ITERATOR(vmi, mm, 0);
+	unsigned long nr_accounted;
+	struct vma_iterator vmi;
 	struct unmap_desc unmap;
+	bool read_locked;
+	bool write_locked;
+	bool tlb_gathered;
+};
+
+static int emmap_classify(struct rust_emmap_state *s)
+{
+	struct vm_area_struct *vma;
+
+	s->nr_accounted = 0;
+	s->vma = NULL;
+	s->read_locked = false;
+	s->write_locked = false;
+	s->tlb_gathered = false;
 
 	/* mm's last user has gone, and its about to be pulled down */
-	mmu_notifier_release(mm);
+	mmu_notifier_release(s->mm);
 
-	mmap_read_lock(mm);
-	arch_exit_mmap(mm);
+	mmap_read_lock(s->mm);
+	s->read_locked = true;
+	arch_exit_mmap(s->mm);
 
-	vma = vma_next(&vmi);
+	vma_iter_init(&s->vmi, s->mm, 0);
+	vma = vma_next(&s->vmi);
 	if (!vma) {
 		/* Can happen if dup_mmap() received an OOM */
-		mmap_read_unlock(mm);
-		mmap_write_lock(mm);
-		goto destroy;
+		mmap_read_unlock(s->mm);
+		s->read_locked = false;
+		mmap_write_lock(s->mm);
+		s->write_locked = true;
+		return EMMAP_EMPTY;
 	}
+	s->vma = vma;
+	return EMMAP_UNMAP;
+}
 
-	unmap_all_init(&unmap, &vmi, vma);
-	flush_cache_mm(mm);
-	tlb_gather_mmu_fullmm(&tlb, mm);
+static void emmap_destroy(struct rust_emmap_state *s)
+{
+	__mt_destroy(&s->mm->mm_mt);
+	trace_exit_mmap(s->mm);
+	mmap_write_unlock(s->mm);
+	s->write_locked = false;
+	vm_unacct_memory(s->nr_accounted);
+}
+
+static void emmap_empty(struct rust_emmap_state *s)
+{
+	emmap_destroy(s);
+}
+
+static void emmap_unmap(struct rust_emmap_state *s)
+{
+	unmap_all_init(&s->unmap, &s->vmi, s->vma);
+	flush_cache_mm(s->mm);
+	tlb_gather_mmu_fullmm(&s->tlb, s->mm);
+	s->tlb_gathered = true;
 	/* update_hiwater_rss(mm) here? but nobody should be looking */
 	/* Use ULONG_MAX here to ensure all VMAs in the mm are unmapped */
-	unmap_vmas(&tlb, &unmap);
-	mmap_read_unlock(mm);
+	unmap_vmas(&s->tlb, &s->unmap);
+	mmap_read_unlock(s->mm);
+	s->read_locked = false;
 
 	/*
 	 * Set MMF_OOM_SKIP to hide this task from the oom killer/reaper
 	 * because the memory has been already freed.
 	 */
-	mm_flags_set(MMF_OOM_SKIP, mm);
-	mmap_write_lock(mm);
-	unmap.mm_wr_locked = true;
-	mt_clear_in_rcu(&mm->mm_mt);
-	unmap_pgtable_init(&unmap, &vmi);
-	free_pgtables(&tlb, &unmap);
-	tlb_finish_mmu(&tlb);
+	mm_flags_set(MMF_OOM_SKIP, s->mm);
+	mmap_write_lock(s->mm);
+	s->write_locked = true;
+	s->unmap.mm_wr_locked = true;
+	mt_clear_in_rcu(&s->mm->mm_mt);
+	unmap_pgtable_init(&s->unmap, &s->vmi);
+	free_pgtables(&s->tlb, &s->unmap);
+	tlb_finish_mmu(&s->tlb);
+	s->tlb_gathered = false;
 
 	/*
 	 * Walk the list again, actually closing and freeing it, with preemption
 	 * enabled, without holding any MM locks besides the unreachable
 	 * mmap_write_lock.
 	 */
-	nr_accounted = tear_down_vmas(mm, &vmi, vma, ULONG_MAX);
+	s->nr_accounted = tear_down_vmas(s->mm, &s->vmi, s->vma, ULONG_MAX);
+	emmap_destroy(s);
+}
 
-destroy:
-	__mt_destroy(&mm->mm_mt);
-	trace_exit_mmap(mm);
-	mmap_write_unlock(mm);
-	vm_unacct_memory(nr_accounted);
+static void emmap_abort(struct rust_emmap_state *s)
+{
+	if (s->tlb_gathered) {
+		tlb_finish_mmu(&s->tlb);
+		s->tlb_gathered = false;
+	}
+	if (s->read_locked) {
+		mmap_read_unlock(s->mm);
+		s->read_locked = false;
+	}
+	if (s->write_locked) {
+		mmap_write_unlock(s->mm);
+		s->write_locked = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_emmap_classify(struct rust_emmap_state *s)
+{
+	return emmap_classify(s);
+}
+
+void rust_emmap_empty(struct rust_emmap_state *s)
+{
+	emmap_empty(s);
+}
+
+void rust_emmap_unmap(struct rust_emmap_state *s)
+{
+	emmap_unmap(s);
+}
+
+void rust_emmap_abort(struct rust_emmap_state *s)
+{
+	emmap_abort(s);
+}
+#endif
+
+static void finish_emmap(struct rust_emmap_state *s)
+{
+	if (emmap_classify(s) == EMMAP_EMPTY)
+		emmap_empty(s);
+	else
+		emmap_unmap(s);
+}
+
+/* Release all mmaps. */
+void exit_mmap(struct mm_struct *mm)
+{
+	struct rust_emmap_state s = {
+		.mm = mm,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+
+		rust_emmap_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_emmap(&s);
 }
 
 /*
