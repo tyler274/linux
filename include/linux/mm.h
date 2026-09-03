@@ -4469,6 +4469,38 @@ int rust_asg_dispatch(struct rust_asg_state *s, int *handled);
 int rust_asg_classify(struct rust_asg_state *s, int *out);
 int rust_asg_sec(struct rust_asg_state *s);
 void rust_asg_abort(struct rust_asg_state *s);
+struct rust_clean_state;
+#define RUST_CLEAN_DONE		0
+#define RUST_CLEAN_CLOSE	1
+void rust_clean_dispatch(struct rust_clean_state *s, int *handled);
+int rust_clean_classify(struct rust_clean_state *s);
+void rust_clean_close(struct rust_clean_state *s);
+void rust_clean_abort(struct rust_clean_state *s);
+struct rust_vabort_state;
+#define RUST_VABORT_DONE	0
+#define RUST_VABORT_REATTACH	1
+#define RUST_VABORT_GAP		2
+void rust_vabort_dispatch(struct rust_vabort_state *s, int *handled);
+int rust_vabort_classify(struct rust_vabort_state *s);
+void rust_vabort_reattach(struct rust_vabort_state *s);
+void rust_vabort_gap(struct rust_vabort_state *s);
+void rust_vabort_abort(struct rust_vabort_state *s);
+struct rust_mset_state;
+#define RUST_MSET_DONE		0
+#define RUST_MSET_GATHER	1
+#define RUST_MSET_LIMITS	2
+int rust_mset_dispatch(struct rust_mset_state *s, int *handled);
+int rust_mset_classify(struct rust_mset_state *s, int *out);
+int rust_mset_gather(struct rust_mset_state *s);
+int rust_mset_limits(struct rust_mset_state *s);
+void rust_mset_abort(struct rust_mset_state *s);
+struct rust_mnf_state;
+#define RUST_MNF_DONE		0
+#define RUST_MNF_MMAP		1
+int rust_mnf_dispatch(struct rust_mnf_state *s, int *handled);
+int rust_mnf_classify(struct rust_mnf_state *s, int *out);
+int rust_mnf_mmap(struct rust_mnf_state *s);
+void rust_mnf_abort(struct rust_mnf_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;

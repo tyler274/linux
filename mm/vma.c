@@ -1886,18 +1886,77 @@ static inline void vms_clear_ptes(struct vma_munmap_struct *vms,
 	vms->clear_ptes = false;
 }
 
-static void vms_clean_up_area(struct vma_munmap_struct *vms,
-		struct ma_state *mas_detach)
+#define CLEAN_DONE		0
+#define CLEAN_CLOSE		1
+
+struct rust_clean_state {
+	struct vma_munmap_struct *vms;
+	struct ma_state *mas_detach;
+};
+
+static int clean_classify(struct rust_clean_state *s)
+{
+	if (!s->vms->nr_pages)
+		return CLEAN_DONE;
+	return CLEAN_CLOSE;
+}
+
+static void clean_close(struct rust_clean_state *s)
 {
 	struct vm_area_struct *vma;
 
-	if (!vms->nr_pages)
-		return;
-
-	vms_clear_ptes(vms, mas_detach, true);
-	mas_set(mas_detach, 0);
-	mas_for_each(mas_detach, vma, ULONG_MAX)
+	vms_clear_ptes(s->vms, s->mas_detach, true);
+	mas_set(s->mas_detach, 0);
+	mas_for_each(s->mas_detach, vma, ULONG_MAX)
 		vma_close(vma);
+}
+
+static void clean_abort(struct rust_clean_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_clean_classify(struct rust_clean_state *s)
+{
+	return clean_classify(s);
+}
+
+void rust_clean_close(struct rust_clean_state *s)
+{
+	clean_close(s);
+}
+
+void rust_clean_abort(struct rust_clean_state *s)
+{
+	clean_abort(s);
+}
+#endif
+
+static void finish_clean(struct rust_clean_state *s)
+{
+	if (clean_classify(s) == CLEAN_DONE)
+		return;
+	clean_close(s);
+}
+
+static void vms_clean_up_area(struct vma_munmap_struct *vms,
+		struct ma_state *mas_detach)
+{
+	struct rust_clean_state s = {
+		.vms = vms,
+		.mas_detach = mas_detach,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+
+		rust_clean_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_clean(&s);
 }
 
 /*
@@ -3464,26 +3523,101 @@ static bool accountable_mapping(struct mmap_state *map)
  * have been called), then a NULL is written over the vmas and the vmas are
  * removed (munmap() completed).
  */
-static void vms_abort_munmap_vmas(struct vma_munmap_struct *vms,
-		struct ma_state *mas_detach)
+#define VABORT_DONE		0
+#define VABORT_REATTACH		1
+#define VABORT_GAP		2
+
+struct rust_vabort_state {
+	struct vma_munmap_struct *vms;
+	struct ma_state *mas_detach;
+};
+
+static int vabort_classify(struct rust_vabort_state *s)
 {
-	struct ma_state *mas = &vms->vmi->mas;
+	if (!s->vms->nr_pages)
+		return VABORT_DONE;
+	if (s->vms->clear_ptes)
+		return VABORT_REATTACH;
+	return VABORT_GAP;
+}
 
-	if (!vms->nr_pages)
-		return;
+static void vabort_reattach(struct rust_vabort_state *s)
+{
+	reattach_vmas(s->mas_detach);
+}
 
-	if (vms->clear_ptes)
-		return reattach_vmas(mas_detach);
+static void vabort_gap(struct rust_vabort_state *s)
+{
+	struct ma_state *mas = &s->vms->vmi->mas;
 
 	/*
 	 * Aborting cannot just call the vm_ops open() because they are often
 	 * not symmetrical and state data has been lost.  Resort to the old
 	 * failure method of leaving a gap where the MAP_FIXED mapping failed.
 	 */
-	mas_set_range(mas, vms->start, vms->end - 1);
-	mas_store_gfp(mas, NULL, GFP_KERNEL|__GFP_NOFAIL);
+	mas_set_range(mas, s->vms->start, s->vms->end - 1);
+	mas_store_gfp(mas, NULL, GFP_KERNEL | __GFP_NOFAIL);
 	/* Clean up the insertion of the unfortunate gap */
-	vms_complete_munmap_vmas(vms, mas_detach);
+	vms_complete_munmap_vmas(s->vms, s->mas_detach);
+}
+
+static void vabort_abort(struct rust_vabort_state *s)
+{
+	(void)s;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vabort_classify(struct rust_vabort_state *s)
+{
+	return vabort_classify(s);
+}
+
+void rust_vabort_reattach(struct rust_vabort_state *s)
+{
+	vabort_reattach(s);
+}
+
+void rust_vabort_gap(struct rust_vabort_state *s)
+{
+	vabort_gap(s);
+}
+
+void rust_vabort_abort(struct rust_vabort_state *s)
+{
+	vabort_abort(s);
+}
+#endif
+
+static void finish_vabort(struct rust_vabort_state *s)
+{
+	int kind = vabort_classify(s);
+
+	if (kind == VABORT_DONE)
+		return;
+	if (kind == VABORT_REATTACH) {
+		vabort_reattach(s);
+		return;
+	}
+	vabort_gap(s);
+}
+
+static void vms_abort_munmap_vmas(struct vma_munmap_struct *vms,
+		struct ma_state *mas_detach)
+{
+	struct rust_vabort_state s = {
+		.vms = vms,
+		.mas_detach = mas_detach,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+
+		rust_vabort_dispatch(&s, &handled);
+		if (handled)
+			return;
+	}
+#endif
+	finish_vabort(&s);
 }
 
 static void update_ksm_flags(struct mmap_state *map)
@@ -3516,37 +3650,69 @@ static void set_desc_from_map(struct vm_area_desc *desc,
  *
  * Returns: 0 on success, error code otherwise.
  */
-static int __mmap_setup(struct mmap_state *map, struct vm_area_desc *desc,
-			struct list_head *uf)
+#define MSET_DONE		0
+#define MSET_GATHER		1
+#define MSET_LIMITS		2
+
+struct rust_mset_state {
+	struct mmap_state *map;
+	struct vm_area_desc *desc;
+	struct list_head *uf;
+	bool gathered;
+};
+
+static int mset_classify(struct rust_mset_state *s, int *out)
 {
-	int error;
+	struct mmap_state *map = s->map;
 	struct vma_iterator *vmi = map->vmi;
 	struct vma_munmap_struct *vms = &map->vms;
 
+	*out = 0;
+	s->gathered = false;
+
 	/* Find the first overlapping VMA and initialise unmap state. */
 	vms->vma = vma_find(vmi, map->end);
-	init_vma_munmap(vms, vmi, vms->vma, map->addr, map->end, uf,
+	init_vma_munmap(vms, vmi, vms->vma, map->addr, map->end, s->uf,
 			/* unlock = */ false);
 
 	/* OK, we have overlapping VMAs - prepare to unmap them. */
-	if (vms->vma) {
-		mt_init_flags(&map->mt_detach,
-			      vmi->mas.tree->ma_flags & MT_FLAGS_LOCK_MASK);
-		mt_on_stack(map->mt_detach);
-		mas_init(&map->mas_detach, &map->mt_detach, /* addr = */ 0);
-		/* Prepare to unmap any existing mapping in the area */
-		error = vms_gather_munmap_vmas(vms, &map->mas_detach);
-		if (error) {
-			/* On error VMAs will already have been reattached. */
-			vms->nr_pages = 0;
-			return error;
-		}
+	if (vms->vma)
+		return MSET_GATHER;
 
-		map->next = vms->next;
-		map->prev = vms->prev;
-	} else {
-		map->next = vma_iter_next_rewind(vmi, &map->prev);
+	map->next = vma_iter_next_rewind(vmi, &map->prev);
+	return MSET_LIMITS;
+}
+
+static int mset_gather(struct rust_mset_state *s)
+{
+	struct mmap_state *map = s->map;
+	struct vma_iterator *vmi = map->vmi;
+	struct vma_munmap_struct *vms = &map->vms;
+	int error;
+
+	mt_init_flags(&map->mt_detach,
+		      vmi->mas.tree->ma_flags & MT_FLAGS_LOCK_MASK);
+	mt_on_stack(map->mt_detach);
+	mas_init(&map->mas_detach, &map->mt_detach, /* addr = */ 0);
+	/* Prepare to unmap any existing mapping in the area */
+	error = vms_gather_munmap_vmas(vms, &map->mas_detach);
+	if (error) {
+		/* On error VMAs will already have been reattached. */
+		vms->nr_pages = 0;
+		return error;
 	}
+
+	map->next = vms->next;
+	map->prev = vms->prev;
+	s->gathered = true;
+	return 0;
+}
+
+static int mset_limits(struct rust_mset_state *s)
+{
+	struct mmap_state *map = s->map;
+	struct vma_munmap_struct *vms = &map->vms;
+	int error;
 
 	/* Check against address space limit. */
 	if (!may_expand_vm(map->mm, &map->vma_flags, map->pglen - vms->nr_pages))
@@ -3574,23 +3740,107 @@ static int __mmap_setup(struct mmap_state *map, struct vm_area_desc *desc,
 	 */
 	vms_clean_up_area(vms, &map->mas_detach);
 
-	set_desc_from_map(desc, map);
+	set_desc_from_map(s->desc, map);
 	return 0;
 }
 
-
-static int __mmap_new_file_vma(struct mmap_state *map,
-			       struct vm_area_struct *vma)
+static void mset_abort(struct rust_mset_state *s)
 {
-	struct vma_iterator *vmi = map->vmi;
-	int error;
+	(void)s;
+}
 
+#ifdef CONFIG_RUST_MMAP
+int rust_mset_classify(struct rust_mset_state *s, int *out)
+{
+	return mset_classify(s, out);
+}
+
+int rust_mset_gather(struct rust_mset_state *s)
+{
+	return mset_gather(s);
+}
+
+int rust_mset_limits(struct rust_mset_state *s)
+{
+	return mset_limits(s);
+}
+
+void rust_mset_abort(struct rust_mset_state *s)
+{
+	mset_abort(s);
+}
+#endif
+
+static int finish_mset(struct rust_mset_state *s)
+{
+	int out = 0;
+	int kind = mset_classify(s, &out);
+
+	if (kind == MSET_DONE)
+		return out;
+	if (kind == MSET_GATHER) {
+		out = mset_gather(s);
+		if (out)
+			return out;
+	}
+	return mset_limits(s);
+}
+
+static int __mmap_setup(struct mmap_state *map, struct vm_area_desc *desc,
+			struct list_head *uf)
+{
+	struct rust_mset_state s = {
+		.map = map,
+		.desc = desc,
+		.uf = uf,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_mset_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_mset(&s);
+}
+
+
+#define MNF_DONE		0
+#define MNF_MMAP		1
+
+struct rust_mnf_state {
+	struct mmap_state *map;
+	struct vm_area_struct *vma;
+	bool got_file;
+};
+
+static int mnf_classify(struct rust_mnf_state *s, int *out)
+{
+	struct mmap_state *map = s->map;
+	struct vm_area_struct *vma = s->vma;
+
+	*out = 0;
+	s->got_file = false;
 	vma->vm_file = map->file;
-	if (!map->file_doesnt_need_get)
+	if (!map->file_doesnt_need_get) {
 		get_file(map->file);
+		s->got_file = true;
+	}
 
 	if (!map->file->f_op->mmap)
-		return 0;
+		return MNF_DONE;
+	return MNF_MMAP;
+}
+
+static int mnf_mmap(struct rust_mnf_state *s)
+{
+	struct mmap_state *map = s->map;
+	struct vm_area_struct *vma = s->vma;
+	struct vma_iterator *vmi = map->vmi;
+	int error;
 
 	error = mmap_file(vma->vm_file, vma);
 	if (error) {
@@ -3598,6 +3848,7 @@ static int __mmap_new_file_vma(struct mmap_state *map,
 			    map->prev, map->next);
 		fput(vma->vm_file);
 		vma->vm_file = NULL;
+		s->got_file = false;
 
 		vma_iter_set(vmi, vma->vm_end);
 		/* Undo any partial mapping done by a device driver. */
@@ -3617,8 +3868,65 @@ static int __mmap_new_file_vma(struct mmap_state *map,
 
 	map->file = vma->vm_file;
 	map->vma_flags = vma->flags;
+	s->got_file = false;
 
 	return 0;
+}
+
+static void mnf_abort(struct rust_mnf_state *s)
+{
+	if (s->vma && s->vma->vm_file) {
+		if (s->got_file)
+			fput(s->vma->vm_file);
+		s->vma->vm_file = NULL;
+		s->got_file = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_mnf_classify(struct rust_mnf_state *s, int *out)
+{
+	return mnf_classify(s, out);
+}
+
+int rust_mnf_mmap(struct rust_mnf_state *s)
+{
+	return mnf_mmap(s);
+}
+
+void rust_mnf_abort(struct rust_mnf_state *s)
+{
+	mnf_abort(s);
+}
+#endif
+
+static int finish_mnf(struct rust_mnf_state *s)
+{
+	int out = 0;
+
+	if (mnf_classify(s, &out) == MNF_DONE)
+		return out;
+	return mnf_mmap(s);
+}
+
+static int __mmap_new_file_vma(struct mmap_state *map,
+			       struct vm_area_struct *vma)
+{
+	struct rust_mnf_state s = {
+		.map = map,
+		.vma = vma,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_mnf_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_mnf(&s);
 }
 
 /*
