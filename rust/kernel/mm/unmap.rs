@@ -30,8 +30,9 @@
 //! `vma_shrink` (prealloc vs apply), `commit_merge` (prealloc vs
 //! apply), `remap_file_pages` (validate vs LSM vs `do_mmap`),
 //! `change_protection` (hugetlb vs page-table range),
-//! `expand_downwards` (prealloc vs grow), and `insert_vm_struct`
-//! (account vs maple link). The
+//! `expand_downwards` (prealloc vs grow), `insert_vm_struct`
+//! (account vs maple link), `__split_vma` (dup vs apply),
+//! `vma_link` (prealloc vs store), and `copy_vma` (merge vs dup). The
 //! VMA maple tree is a Rust RCU range array.
 //! File mmap/shmem / page-table walk / madvise per-hint / seal-range /
 //! mlock page-walk / msync / mincore walk bodies stay in C. The mmap lock is already
@@ -149,6 +150,21 @@ const EXDN_APPLY: i32 = 1;
 const IVS_DONE: i32 = 0;
 /// Checks passed; `vma_link` into the maple tree.
 const IVS_LINK: i32 = 1;
+
+/// Matches `RUST_SVMA_*` in `include/linux/mm.h`.
+const SVMA_DONE: i32 = 0;
+/// Dup and prealloc ok; policy/THP/complete.
+const SVMA_APPLY: i32 = 1;
+
+/// Matches `RUST_VLINK_*` in `include/linux/mm.h`.
+const VLINK_DONE: i32 = 0;
+/// Prealloc ok; store and link file.
+const VLINK_STORE: i32 = 1;
+
+/// Matches `RUST_CVMA_*` in `include/linux/mm.h`.
+const CVMA_DONE: i32 = 0;
+/// Could not merge; dup and `vma_link`.
+const CVMA_DUP: i32 = 1;
 
 /// Matches `RUST_MPROTECT_*` in `include/linux/mm.h`.
 const MPROTECT_DONE: i32 = 0;
@@ -308,6 +324,9 @@ static N_RFP: Atomic<u32> = Atomic::new(0);
 static N_CP: Atomic<u32> = Atomic::new(0);
 static N_EXDN: Atomic<u32> = Atomic::new(0);
 static N_IVS: Atomic<u32> = Atomic::new(0);
+static N_SVMA: Atomic<u32> = Atomic::new(0);
+static N_VLINK: Atomic<u32> = Atomic::new(0);
+static N_CVMA: Atomic<u32> = Atomic::new(0);
 static N_VEX: Atomic<u32> = Atomic::new(0);
 static N_MNVA: Atomic<u32> = Atomic::new(0);
 static N_MPFIX: Atomic<u32> = Atomic::new(0);
@@ -516,7 +535,7 @@ fn unmapped_topdown(mm: *mut bindings::mm_struct, s: &Search) -> Option<u64> {
 
 /// Log that Rust is serving `vm_unmapped_area` and mmap-family sequencing.
 pub fn announce() {
-    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages/change_protection/expand_downwards/insert_vm_struct sequencer\n");
+    pr_info!("rust-mmap: vm_unmapped_area first-fit/topdown and mmap/munmap/brk/mprotect/mremap/madvise/mmap_region/mprotect_fixup/mseal/mlock/mlock_fixup/mprotect_walk/munlock/mlockall/msync/mincore/vector_madvise/madvise_do/madvise_walk/madvise_vma/madvise_dontneed/madvise_update/vma_merge/mmap_new/sys_brk/process_madvise/vm_brk/vma_merge_existing/vma_expand/expand_stack/vma_modify/vma_shrink/commit_merge/remap_file_pages/change_protection/expand_downwards/insert_vm_struct/split_vma/vma_link/copy_vma sequencer\n");
     crate::mm::mtree::announce_once();
 }
 
@@ -2483,6 +2502,138 @@ pub unsafe extern "C" fn rust_ivs_dispatch(
             // SAFETY: Unaccount a leftover charge.
             unsafe { bindings::rust_ivs_abort(s) };
             EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `__split_vma` after C dups and preallocates.
+///
+/// Sets `*handled` once classify has run. Policy, THP, and maple store
+/// stay in C. Unknown kind frees the dup and maple prealloc.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_svma_state` with `vmi`/`vma`/`addr`/
+/// `new_below` filled. mmap write lock held. `handled` must be a
+/// valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_svma_dispatch(
+    s: *mut bindings::rust_svma_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may dup the VMA and preallocate.
+    let kind = unsafe { bindings::rust_svma_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_SVMA.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first split_vma sequenced\n");
+    }
+
+    match kind {
+        SVMA_DONE => out,
+        // SAFETY: Dup and prealloc ok; split in C.
+        SVMA_APPLY => unsafe { bindings::rust_svma_apply(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown split_vma kind {kind}\n");
+            // SAFETY: Free dup and maple prealloc.
+            unsafe { bindings::rust_svma_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `vma_link` after C preallocates maple nodes.
+///
+/// Sets `*handled` once classify has run. Store and file rmap stay in
+/// C. Unknown kind frees leftover maple prealloc.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_vlink_state` with `mm`/`vma` filled. mmap
+/// write lock held. `handled` must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_vlink_dispatch(
+    s: *mut bindings::rust_vlink_state,
+    handled: *mut c_int,
+) -> c_int {
+    if s.is_null() || handled.is_null() {
+        return EINVAL.to_errno();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut out: c_int = 0;
+    // SAFETY: `s` is live; classify may preallocate maple nodes.
+    let kind = unsafe { bindings::rust_vlink_classify(s, &mut out) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_VLINK.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first vma_link sequenced\n");
+    }
+
+    match kind {
+        VLINK_DONE => out,
+        // SAFETY: Prealloc ok; store and link file in C.
+        VLINK_STORE => unsafe { bindings::rust_vlink_store(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown vma_link kind {kind}\n");
+            // SAFETY: Drop leftover maple prealloc.
+            unsafe { bindings::rust_vlink_abort(s) };
+            EINVAL.to_errno()
+        }
+    }
+}
+
+/// C ABI: sequence `copy_vma` after C tries a merge.
+///
+/// Sets `*handled` once classify has run. Dup, policy, and `vma_link`
+/// stay in C.
+///
+/// # Safety
+///
+/// `s` must be a live `rust_cvma_state` with `vmap`/`addr`/`len`/
+/// `pgoff`/`need_rmap_locks` filled. mmap write lock held. `handled`
+/// must be a valid out-parameter.
+#[no_mangle]
+pub unsafe extern "C" fn rust_cvma_dispatch(
+    s: *mut bindings::rust_cvma_state,
+    handled: *mut c_int,
+) -> *mut bindings::vm_area_struct {
+    if s.is_null() || handled.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Caller supplies a writable out-parameter.
+    unsafe { *handled = 0 };
+
+    let mut merged = ptr::null_mut();
+    // SAFETY: `s` is live; classify may merge into an adjacent VMA.
+    let kind = unsafe { bindings::rust_cvma_classify(s, &mut merged) };
+    // SAFETY: `handled` is valid.
+    unsafe { *handled = 1 };
+
+    let prev = N_CVMA.fetch_add(1, Relaxed);
+    if prev == 0 {
+        pr_info!("rust-mmap: first copy_vma sequenced\n");
+    }
+
+    match kind {
+        CVMA_DONE => merged,
+        // SAFETY: Could not merge; dup and link in C.
+        CVMA_DUP => unsafe { bindings::rust_cvma_dup(s) },
+        _ => {
+            pr_err!("rust-mmap: unknown copy_vma kind {kind}\n");
+            ptr::null_mut()
         }
     }
 }

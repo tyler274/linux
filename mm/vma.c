@@ -540,38 +540,68 @@ void unmap_region(struct unmap_desc *unmap)
  * has already been checked or doesn't make sense to fail.
  * VMA Iterator will point to the original VMA.
  */
-static __must_check int
-__split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
-	    unsigned long addr, int new_below)
+#define SVMA_DONE		0
+#define SVMA_APPLY		1
+
+struct rust_svma_state {
+	struct vma_iterator *vmi;
+	struct vm_area_struct *vma;
+	unsigned long addr;
+	int new_below;
+	struct vm_area_struct *new;
+};
+
+static int svma_classify(struct rust_svma_state *s, int *out)
 {
-	struct vma_prepare vp;
+	struct vm_area_struct *vma = s->vma;
 	struct vm_area_struct *new;
 	int err;
 
-	WARN_ON(vma->vm_start >= addr);
-	WARN_ON(vma->vm_end <= addr);
+	s->new = NULL;
+	*out = 0;
+
+	WARN_ON(vma->vm_start >= s->addr);
+	WARN_ON(vma->vm_end <= s->addr);
 
 	if (vma->vm_ops && vma->vm_ops->may_split) {
-		err = vma->vm_ops->may_split(vma, addr);
-		if (err)
-			return err;
+		err = vma->vm_ops->may_split(vma, s->addr);
+		if (err) {
+			*out = err;
+			return SVMA_DONE;
+		}
 	}
 
 	new = vm_area_dup(vma);
-	if (!new)
-		return -ENOMEM;
-
-	if (new_below) {
-		new->vm_end = addr;
-	} else {
-		new->vm_start = addr;
-		vma_add_pgoff(new, linear_page_delta(vma, addr));
+	if (!new) {
+		*out = -ENOMEM;
+		return SVMA_DONE;
 	}
 
-	err = -ENOMEM;
-	vma_iter_config(vmi, new->vm_start, new->vm_end);
-	if (vma_iter_prealloc(vmi, new))
-		goto out_free_vma;
+	if (s->new_below) {
+		new->vm_end = s->addr;
+	} else {
+		new->vm_start = s->addr;
+		vma_add_pgoff(new, linear_page_delta(vma, s->addr));
+	}
+
+	vma_iter_config(s->vmi, new->vm_start, new->vm_end);
+	if (vma_iter_prealloc(s->vmi, new)) {
+		vm_area_free(new);
+		*out = -ENOMEM;
+		return SVMA_DONE;
+	}
+	s->new = new;
+	return SVMA_APPLY;
+}
+
+static int svma_apply(struct rust_svma_state *s)
+{
+	struct vma_iterator *vmi = s->vmi;
+	struct vm_area_struct *vma = s->vma;
+	struct vm_area_struct *new = s->new;
+	unsigned long addr = s->addr;
+	struct vma_prepare vp;
+	int err = -ENOMEM;
 
 	err = vma_dup_policy(vma, new);
 	if (err)
@@ -602,7 +632,7 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	if (is_vm_hugetlb_page(vma))
 		hugetlb_split(vma, addr);
 
-	if (new_below) {
+	if (s->new_below) {
 		vma->vm_start = addr;
 		vma_add_pgoff(vma, linear_page_delta(new, addr));
 	} else {
@@ -612,9 +642,10 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	/* vma_complete stores the new vma */
 	vma_complete(&vp, vmi, vma->vm_mm);
 	validate_mm(vma->vm_mm);
+	s->new = NULL;
 
 	/* Success. */
-	if (new_below)
+	if (s->new_below)
 		vma_next(vmi);
 	else
 		vma_prev(vmi);
@@ -625,9 +656,67 @@ out_free_mpol:
 	mpol_put(vma_policy(new));
 out_free_vmi:
 	vma_iter_free(vmi);
-out_free_vma:
 	vm_area_free(new);
+	s->new = NULL;
 	return err;
+}
+
+static void svma_abort(struct rust_svma_state *s)
+{
+	if (s->new) {
+		vma_iter_free(s->vmi);
+		vm_area_free(s->new);
+		s->new = NULL;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_svma_classify(struct rust_svma_state *s, int *out)
+{
+	return svma_classify(s, out);
+}
+
+int rust_svma_apply(struct rust_svma_state *s)
+{
+	return svma_apply(s);
+}
+
+void rust_svma_abort(struct rust_svma_state *s)
+{
+	svma_abort(s);
+}
+#endif
+
+static int finish_svma(struct rust_svma_state *s)
+{
+	int out = 0;
+
+	if (svma_classify(s, &out) == SVMA_DONE)
+		return out;
+	return svma_apply(s);
+}
+
+static __must_check int
+__split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+	    unsigned long addr, int new_below)
+{
+	struct rust_svma_state s = {
+		.vmi = vmi,
+		.vma = vma,
+		.addr = addr,
+		.new_below = new_below,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
+
+		rust_ret = rust_svma_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_svma(&s);
 }
 
 /*
@@ -2376,50 +2465,160 @@ static void vma_link_file(struct vm_area_struct *vma, bool hold_rmap_lock)
 	}
 }
 
+#define VLINK_DONE		0
+#define VLINK_STORE		1
+
+struct rust_vlink_state {
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
+	bool prealloced;
+};
+
+static int vlink_classify(struct rust_vlink_state *s, int *out)
+{
+	*out = 0;
+	s->prealloced = false;
+	vma_iter_init(&s->vmi, s->mm, 0);
+	vma_iter_config(&s->vmi, s->vma->vm_start, s->vma->vm_end);
+	if (vma_iter_prealloc(&s->vmi, s->vma)) {
+		*out = -ENOMEM;
+		return VLINK_DONE;
+	}
+	s->prealloced = true;
+	return VLINK_STORE;
+}
+
+static int vlink_store(struct rust_vlink_state *s)
+{
+	vma_start_write(s->vma);
+	vma_iter_store_new(&s->vmi, s->vma);
+	s->prealloced = false;
+	vma_link_file(s->vma, /* hold_rmap_lock= */false);
+	s->mm->map_count++;
+	validate_mm(s->mm);
+	return 0;
+}
+
+static void vlink_abort(struct rust_vlink_state *s)
+{
+	if (s->prealloced) {
+		vma_iter_free(&s->vmi);
+		s->prealloced = false;
+	}
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_vlink_classify(struct rust_vlink_state *s, int *out)
+{
+	return vlink_classify(s, out);
+}
+
+int rust_vlink_store(struct rust_vlink_state *s)
+{
+	return vlink_store(s);
+}
+
+void rust_vlink_abort(struct rust_vlink_state *s)
+{
+	vlink_abort(s);
+}
+#endif
+
+static int finish_vlink(struct rust_vlink_state *s)
+{
+	int out = 0;
+
+	if (vlink_classify(s, &out) == VLINK_DONE)
+		return out;
+	return vlink_store(s);
+}
+
 static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma)
 {
-	VMA_ITERATOR(vmi, mm, 0);
+	struct rust_vlink_state s = {
+		.mm = mm,
+		.vma = vma,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		int rust_ret;
 
-	vma_iter_config(&vmi, vma->vm_start, vma->vm_end);
-	if (vma_iter_prealloc(&vmi, vma))
-		return -ENOMEM;
-
-	vma_start_write(vma);
-	vma_iter_store_new(&vmi, vma);
-	vma_link_file(vma, /* hold_rmap_lock= */false);
-	mm->map_count++;
-	validate_mm(mm);
-	return 0;
+		rust_ret = rust_vlink_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_vlink(&s);
 }
 
 /*
  * Copy the vma structure to a new location in the same mm,
  * prior to moving page table entries, to effect an mremap move.
  */
-struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
-	unsigned long addr, unsigned long len, pgoff_t pgoff,
-	pgoff_t anon_pgoff, bool *need_rmap_locks)
+#define CVMA_DONE		0
+#define CVMA_DUP		1
+
+struct rust_cvma_state {
+	struct vm_area_struct **vmap;
+	unsigned long addr;
+	unsigned long len;
+	pgoff_t pgoff;
+	pgoff_t anon_pgoff;
+	bool *need_rmap_locks;
+	struct vm_area_struct *vma;
+	unsigned long old_vma_start;
+	bool can_self_merge;
+};
+
+static int cvma_classify(struct rust_cvma_state *s,
+			 struct vm_area_struct **ret)
 {
-	struct vm_area_struct *vma = *vmap;
-	unsigned long old_vma_start = vma->vm_start;
-	struct mm_struct *mm = vma->vm_mm;
+	struct vm_area_struct *vma;
 	struct vm_area_struct *new_vma;
-	bool can_self_merge = false;
-	VMA_ITERATOR(vmi, mm, addr);
-	VMG_VMA_STATE(vmg, &vmi, NULL, vma, addr, addr + len);
+	struct mm_struct *mm;
+	struct vma_iterator vmi;
+	struct vma_merge_struct vmg;
+
+	*ret = NULL;
+	s->vma = vma = *s->vmap;
+	s->old_vma_start = vma->vm_start;
+	s->can_self_merge = false;
+	mm = vma->vm_mm;
 
 	/*
 	 * If a vma has not yet been faulted, update its anonymous pgoff to
 	 * match the new location to increase its chance of merging.
 	 */
 	if (!vma->anon_vma) {
-		anon_pgoff = addr >> PAGE_SHIFT;
+		s->anon_pgoff = s->addr >> PAGE_SHIFT;
 
 		if (vma_is_anonymous(vma)) {
-			pgoff = anon_pgoff;
-			can_self_merge = true;
+			s->pgoff = s->anon_pgoff;
+			s->can_self_merge = true;
 		}
 	}
+
+	vma_iter_init(&vmi, mm, s->addr);
+	vmg = (struct vma_merge_struct) {
+		.mm = vma->vm_mm,
+		.vmi = &vmi,
+		.prev = NULL,
+		.middle = vma,
+		.next = NULL,
+		.start = s->addr,
+		.end = s->addr + s->len,
+		.vm_flags = vma->vm_flags,
+		.pgoff = linear_page_index(vma, s->addr),
+		.anon_pgoff = __linear_anon_page_index(vma, s->addr),
+		.file = vma->vm_file,
+		.anon_vma = vma->anon_vma,
+		.policy = vma_policy(vma),
+		.uffd_ctx = vma->vm_userfaultfd_ctx,
+		.anon_name = anon_vma_name(vma),
+		.state = VMA_MERGE_START,
+	};
 
 	/*
 	 * If the VMA we are copying might contain a uprobe PTE, ensure
@@ -2429,19 +2628,19 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 	if (vma->vm_file)
 		vmg.skip_vma_uprobe = true;
 
-	new_vma = find_vma_prev(mm, addr, &vmg.prev);
-	if (new_vma && new_vma->vm_start < addr + len)
-		return NULL;	/* should never get here */
+	new_vma = find_vma_prev(mm, s->addr, &vmg.prev);
+	if (new_vma && new_vma->vm_start < s->addr + s->len)
+		return CVMA_DONE;	/* should never get here */
 
-	vmg.pgoff = pgoff;
-	vmg.anon_pgoff = anon_pgoff;
+	vmg.pgoff = s->pgoff;
+	vmg.anon_pgoff = s->anon_pgoff;
 	vmg.next = vma_iter_next_rewind(&vmi, NULL);
 	new_vma = vma_merge_copied_range(&vmg);
 
 	if (new_vma) {
 		/* Self-merged and VMA replaced. */
-		if (unlikely(new_vma->vm_start < old_vma_start &&
-			     new_vma->vm_end > old_vma_start)) {
+		if (unlikely(new_vma->vm_start < s->old_vma_start &&
+			     new_vma->vm_end > s->old_vma_start)) {
 			/*
 			 * The only way a VMA can both self-merge and be
 			 * replaced is if the remap places the new VMA
@@ -2453,28 +2652,39 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 			 * This should only be possible if the anonymous page
 			 * offset was updated, i.e. the VMA is unfaulted.
 			 */
-			VM_WARN_ON_ONCE_VMA(!can_self_merge, new_vma);
-			*vmap = vma = new_vma;
+			VM_WARN_ON_ONCE_VMA(!s->can_self_merge, new_vma);
+			*s->vmap = s->vma = vma = new_vma;
 		}
-		*need_rmap_locks =
+		*s->need_rmap_locks =
 			(vma_start_pgoff(new_vma) <= vma_start_pgoff(vma));
-	} else {
-		new_vma = vm_area_dup(vma);
-		if (!new_vma)
-			goto out;
-		vma_set_range(new_vma, addr, addr + len, pgoff, anon_pgoff);
-		if (vma_dup_policy(vma, new_vma))
-			goto out_free_vma;
-		if (anon_vma_clone(new_vma, vma, VMA_OP_REMAP))
-			goto out_free_mempol;
-		if (new_vma->vm_file)
-			get_file(new_vma->vm_file);
-		if (new_vma->vm_ops && new_vma->vm_ops->open)
-			new_vma->vm_ops->open(new_vma);
-		if (vma_link(mm, new_vma))
-			goto out_vma_link;
-		*need_rmap_locks = false;
+		*ret = new_vma;
+		return CVMA_DONE;
 	}
+	return CVMA_DUP;
+}
+
+static struct vm_area_struct *cvma_dup(struct rust_cvma_state *s)
+{
+	struct vm_area_struct *vma = s->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct vm_area_struct *new_vma;
+
+	new_vma = vm_area_dup(vma);
+	if (!new_vma)
+		goto out;
+	vma_set_range(new_vma, s->addr, s->addr + s->len, s->pgoff,
+		      s->anon_pgoff);
+	if (vma_dup_policy(vma, new_vma))
+		goto out_free_vma;
+	if (anon_vma_clone(new_vma, vma, VMA_OP_REMAP))
+		goto out_free_mempol;
+	if (new_vma->vm_file)
+		get_file(new_vma->vm_file);
+	if (new_vma->vm_ops && new_vma->vm_ops->open)
+		new_vma->vm_ops->open(new_vma);
+	if (vma_link(mm, new_vma))
+		goto out_vma_link;
+	*s->need_rmap_locks = false;
 	return new_vma;
 
 out_vma_link:
@@ -2491,6 +2701,52 @@ out_free_vma:
 	vm_area_free(new_vma);
 out:
 	return NULL;
+}
+
+#ifdef CONFIG_RUST_MMAP
+int rust_cvma_classify(struct rust_cvma_state *s, struct vm_area_struct **ret)
+{
+	return cvma_classify(s, ret);
+}
+
+struct vm_area_struct *rust_cvma_dup(struct rust_cvma_state *s)
+{
+	return cvma_dup(s);
+}
+#endif
+
+static struct vm_area_struct *finish_cvma(struct rust_cvma_state *s)
+{
+	struct vm_area_struct *ret = NULL;
+
+	if (cvma_classify(s, &ret) == CVMA_DONE)
+		return ret;
+	return cvma_dup(s);
+}
+
+struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+	unsigned long addr, unsigned long len, pgoff_t pgoff,
+	pgoff_t anon_pgoff, bool *need_rmap_locks)
+{
+	struct rust_cvma_state s = {
+		.vmap = vmap,
+		.addr = addr,
+		.len = len,
+		.pgoff = pgoff,
+		.anon_pgoff = anon_pgoff,
+		.need_rmap_locks = need_rmap_locks,
+	};
+#ifdef CONFIG_RUST_MMAP
+	{
+		int handled = 0;
+		struct vm_area_struct *rust_ret;
+
+		rust_ret = rust_cvma_dispatch(&s, &handled);
+		if (handled)
+			return rust_ret;
+	}
+#endif
+	return finish_cvma(&s);
 }
 
 /*

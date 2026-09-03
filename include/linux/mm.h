@@ -4403,6 +4403,28 @@ int rust_ivs_dispatch(struct rust_ivs_state *s, int *handled);
 int rust_ivs_classify(struct rust_ivs_state *s, int *out);
 int rust_ivs_link(struct rust_ivs_state *s);
 void rust_ivs_abort(struct rust_ivs_state *s);
+struct rust_svma_state;
+#define RUST_SVMA_DONE		0
+#define RUST_SVMA_APPLY		1
+int rust_svma_dispatch(struct rust_svma_state *s, int *handled);
+int rust_svma_classify(struct rust_svma_state *s, int *out);
+int rust_svma_apply(struct rust_svma_state *s);
+void rust_svma_abort(struct rust_svma_state *s);
+struct rust_vlink_state;
+#define RUST_VLINK_DONE		0
+#define RUST_VLINK_STORE	1
+int rust_vlink_dispatch(struct rust_vlink_state *s, int *handled);
+int rust_vlink_classify(struct rust_vlink_state *s, int *out);
+int rust_vlink_store(struct rust_vlink_state *s);
+void rust_vlink_abort(struct rust_vlink_state *s);
+struct rust_cvma_state;
+#define RUST_CVMA_DONE		0
+#define RUST_CVMA_DUP		1
+struct vm_area_struct *rust_cvma_dispatch(struct rust_cvma_state *s,
+					  int *handled);
+int rust_cvma_classify(struct rust_cvma_state *s,
+		       struct vm_area_struct **ret);
+struct vm_area_struct *rust_cvma_dup(struct rust_cvma_state *s);
 struct rust_mprotect_req {
 	unsigned long start;
 	size_t len;

@@ -236,8 +236,9 @@ config RUST_MMAP
 	  vma_shrink (prealloc vs apply), commit_merge (prealloc vs
 	  apply), remap_file_pages (validate vs LSM vs do_mmap),
 	  change_protection (hugetlb vs page-table range),
-	  expand_downwards (prealloc vs grow), and insert_vm_struct
-	  (account vs maple link).
+	  expand_downwards (prealloc vs grow), insert_vm_struct
+	  (account vs maple link), __split_vma (dup vs apply),
+	  vma_link (prealloc vs store), and copy_vma (merge vs dup).
 	  The VMA maple tree is a Rust RCU range array; irq and
 	  other maple trees stay in C.
 	  File mmap/shmem and page-table walk bodies stay in C.
